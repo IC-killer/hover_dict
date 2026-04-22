@@ -29,6 +29,10 @@ pub fn capture_selected_text() -> Option<String> {
     {
         let _ = enigo.key(Key::Control, Direction::Press);
         thread::sleep(Duration::from_millis(20));
+        // Windows 上用真实按键（Key::C）更稳，避免 Unicode 路径触发奇怪的修饰键行为（如 Alt 菜单提示）。
+        #[cfg(target_os = "windows")]
+        let _ = enigo.key(Key::C, Direction::Click);
+        #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
         let _ = enigo.key(Key::Unicode('c'), Direction::Click);
         thread::sleep(Duration::from_millis(20));
         let _ = enigo.key(Key::Control, Direction::Release);

@@ -10,6 +10,7 @@ use rdev::{Event, EventType, listen};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Instant;
 use translator::{LocalSqliteDict, TranslateResult};
 use tray_icon::{
     Icon, TrayIconBuilder,
@@ -72,35 +73,64 @@ fn setup_custom_fonts(ctx: &egui::Context) {
 struct SharedState {
     current_result: Option<TranslateResult>,
     is_window_visible: bool,
-    pending_pos: Option<(f32, f32)>, // 新增
+    // 来自鼠标钩子的屏幕像素坐标（physical pixels），需要在 egui 中换算为 logical points。
+    pending_pos: Option<(i32, i32)>,
+    shown_at: Option<Instant>,
 }
 
 struct HoverDictApp {
     shared_state: Arc<Mutex<SharedState>>,
     _tray_icon: tray_icon::TrayIcon,
     is_first_frame: bool,
+    // 只在状态变化时发送窗口命令，避免每帧 OuterPosition/InnerSize 导致卡死
+    last_visible: bool,
 }
 
 impl eframe::App for HoverDictApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.is_first_frame {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            // 不要把根窗口设为 Visible(false)：
+            // 在 Windows 上根窗口隐藏后，可能不会再驱动 update，从而无法“再显示”弹窗。
+            // 采用更稳健的策略：窗口始终存在，但默认移到屏幕外 + 缩成 1x1。
+            // 注意：MousePassthrough 在部分 Windows 环境下配合透明窗口/连点会导致窗口消息异常（表现为卡死），因此不用它。
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(1.0, 1.0)));
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(-10_000.0, -10_000.0)));
             self.is_first_frame = false;
+            self.last_visible = false;
         }
 
-        let mut state = self.shared_state.lock().unwrap();
+        // 注意：不要在整个 update() 周期持有 Mutex。
+        // 否则后台线程（划词/查询）一旦也需要拿锁，就可能造成 UI 线程阻塞，
+        // 表现为窗口“未响应”，连 Esc/鼠标也失效。
+        let (pending_pos, is_window_visible, current_result, _shown_at) = {
+            let mut state = self.shared_state.lock().unwrap();
+            (
+                state.pending_pos.take(),
+                state.is_window_visible,
+                state.current_result.clone(),
+                state.shown_at,
+            )
+        };
 
-        // Debugging: log visibility state
-        println!("Window Visible: {}", state.is_window_visible);
-
-        if let Some((x, y)) = state.pending_pos.take() {
-            println!("Setting position: ({}, {})", x, y);
-            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(x, y)));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        // 只在“隐藏 -> 显示”的那一刻设置位置/大小/穿透/焦点
+        if is_window_visible && !self.last_visible {
+            if let Some((px, py)) = pending_pos {
+                let ppp = ctx.pixels_per_point();
+                let x = px as f32 / ppp;
+                let y = py as f32 / ppp;
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(x, y)));
+            }
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(300.0, 200.0)));
+            // 不强制抢焦点：交互关闭改用按钮/全局 Esc 兜底，避免透明置顶窗口在频繁点击时出现焦点/事件异常。
         }
 
-        if state.is_window_visible {
+        // 只在“显示 -> 隐藏”的那一刻把窗口挪走/缩小/穿透
+        if !is_window_visible && self.last_visible {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(1.0, 1.0)));
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(-10_000.0, -10_000.0)));
+        }
+
+        if is_window_visible {
             egui::CentralPanel::default()
                 .frame(
                     egui::Frame::window(&ctx.style())
@@ -108,7 +138,16 @@ impl eframe::App for HoverDictApp {
                         .rounding(8.0),
                 )
                 .show(ctx, |ui| {
-                    if let Some(res) = &state.current_result {
+                    // 显式关闭按钮（比“点击外部关闭”稳定）
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                        if ui.button("×").clicked() {
+                            if let Ok(mut st) = self.shared_state.lock() {
+                                st.is_window_visible = false;
+                            }
+                        }
+                    });
+
+                    if let Some(res) = &current_result {
                         ui.heading(
                             egui::RichText::new(&res.source_text).color(egui::Color32::BLACK),
                         );
@@ -126,18 +165,9 @@ impl eframe::App for HoverDictApp {
                         );
                     }
                 });
-
-            // Debugging: ensure we attempt to hide the window if the user clicks outside
-            if ctx.input(|i| i.pointer.any_pressed() && !ctx.is_pointer_over_area())
-                || ctx.input(|i| i.key_pressed(egui::Key::Escape))
-            {
-                println!("Hiding window after click or escape.");
-                state.is_window_visible = false;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-            }
-        } else {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
+
+        self.last_visible = is_window_visible;
     }
 }
 
@@ -151,7 +181,8 @@ fn main() -> eframe::Result<()> {
     let shared_state = Arc::new(Mutex::new(SharedState {
         current_result: None,
         is_window_visible: false,
-        pending_pos: None, // 新增
+        pending_pos: None,
+        shown_at: None,
     }));
 
     let tray_menu = Menu::new();
@@ -170,8 +201,9 @@ fn main() -> eframe::Result<()> {
             .with_decorations(false)
             .with_always_on_top()
             .with_transparent(true)
-            .with_visible(false)
-            .with_inner_size([300.0, 200.0]),
+            // 根窗口保持可见，避免隐藏后无法唤醒
+            .with_visible(true)
+            .with_inner_size([1.0, 1.0]),
         ..Default::default()
     };
 
@@ -209,6 +241,9 @@ fn main() -> eframe::Result<()> {
                                 let mut st = state_clone.lock().unwrap(); // 锁住状态
                                 st.current_result = Some(res); // 设置翻译结果
                                 st.is_window_visible = true; // 设置窗口可见
+                                // 在鼠标抬起位置附近弹出窗口；注意此处是屏幕像素坐标
+                                st.pending_pos = Some((up_x + 12, up_y + 12));
+                                st.shown_at = Some(Instant::now());
                                 drop(st); // 释放锁
 
                                 ctx_clone.request_repaint(); // 请求重新绘制
@@ -225,6 +260,8 @@ fn main() -> eframe::Result<()> {
             });
 
             let is_enabled_hook = Arc::clone(&is_capture_enabled);
+            let state_for_hook = Arc::clone(&shared_state);
+            let ctx_for_hook = cc.egui_ctx.clone();
             thread::spawn(move || {
                 let mut down_x = 0;
                 let mut down_y = 0;
@@ -248,6 +285,15 @@ fn main() -> eframe::Result<()> {
                             let _ = capture_tx.send((up_x, up_y));
                         }
                     }
+                    // 全局兜底：即使 UI 线程卡住，也能用 Esc 强制隐藏弹窗
+                    EventType::KeyPress(rdev::Key::Escape) => {
+                        if let Ok(mut st) = state_for_hook.lock() {
+                            st.is_window_visible = false;
+                        }
+                        ctx_for_hook.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(1.0, 1.0)));
+                        ctx_for_hook.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(-10_000.0, -10_000.0)));
+                        ctx_for_hook.request_repaint();
+                    }
                     _ => {}
                 };
                 if let Err(_) = listen(callback) {}
@@ -257,6 +303,7 @@ fn main() -> eframe::Result<()> {
                 shared_state,
                 _tray_icon: tray_icon,
                 is_first_frame: true,
+                last_visible: false,
             })
         }),
     )
