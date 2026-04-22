@@ -90,8 +90,11 @@ impl eframe::App for HoverDictApp {
 
         let mut state = self.shared_state.lock().unwrap();
 
-        // 处理待显示的位置指令
+        // Debugging: log visibility state
+        println!("Window Visible: {}", state.is_window_visible);
+
         if let Some((x, y)) = state.pending_pos.take() {
+            println!("Setting position: ({}, {})", x, y);
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(x, y)));
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -124,9 +127,11 @@ impl eframe::App for HoverDictApp {
                     }
                 });
 
+            // Debugging: ensure we attempt to hide the window if the user clicks outside
             if ctx.input(|i| i.pointer.any_pressed() && !ctx.is_pointer_over_area())
                 || ctx.input(|i| i.key_pressed(egui::Key::Escape))
             {
+                println!("Hiding window after click or escape.");
                 state.is_window_visible = false;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             }
@@ -197,30 +202,23 @@ fn main() -> eframe::Result<()> {
                 let dict = LocalSqliteDict::new("dict.db");
 
                 while let Ok((up_x, up_y)) = capture_rx.recv() {
-                    // == 调试通知 1：确认收到了划词动作 ==
-                    // show_notify("后台收到了划词", "正在尝试抓取文本...");
-
                     if let Some(text) = capture_selected_text() {
-                        // == 调试通知 2：确认成功抓到了字 ==
-                        // show_notify("抓取成功", &text);
-
                         match dict.translate(&text) {
                             Ok(Some(res)) => {
-                                show_notify("查询成功", &res.translation); // 加这行
-                                let mut st = state_clone.lock().unwrap();
-                                st.current_result = Some(res);
-                                st.is_window_visible = true;
-                                drop(st);
+                                show_notify("查询成功", &res.translation); // 弹出通知
+                                let mut st = state_clone.lock().unwrap(); // 锁住状态
+                                st.current_result = Some(res); // 设置翻译结果
+                                st.is_window_visible = true; // 设置窗口可见
+                                drop(st); // 释放锁
 
-                                ctx_clone.request_repaint();
+                                ctx_clone.request_repaint(); // 请求重新绘制
                             }
                             Ok(None) => {
-                                show_notify("查询结果", "词库里没有这个词"); // 加这行
+                                show_notify("查询结果", "词库里没有这个词");
                             }
                             Err(e) => show_notify("查询错误", &e.to_string()),
                         }
                     } else {
-                        // == 调试通知 3：如果没抓到，弹出来看看 ==
                         show_notify("抓取失败", "未能获取选中文本");
                     }
                 }
