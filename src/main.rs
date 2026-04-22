@@ -72,6 +72,7 @@ fn setup_custom_fonts(ctx: &egui::Context) {
 struct SharedState {
     current_result: Option<TranslateResult>,
     is_window_visible: bool,
+    pending_pos: Option<(f32, f32)>, // 新增
 }
 
 struct HoverDictApp {
@@ -88,6 +89,13 @@ impl eframe::App for HoverDictApp {
         }
 
         let mut state = self.shared_state.lock().unwrap();
+
+        // 处理待显示的位置指令
+        if let Some((x, y)) = state.pending_pos.take() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(x, y)));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
 
         if state.is_window_visible {
             egui::CentralPanel::default()
@@ -138,6 +146,7 @@ fn main() -> eframe::Result<()> {
     let shared_state = Arc::new(Mutex::new(SharedState {
         current_result: None,
         is_window_visible: false,
+        pending_pos: None, // 新增
     }));
 
     let tray_menu = Menu::new();
@@ -193,23 +202,21 @@ fn main() -> eframe::Result<()> {
 
                     if let Some(text) = capture_selected_text() {
                         // == 调试通知 2：确认成功抓到了字 ==
-                        show_notify("抓取成功", &text);
+                        // show_notify("抓取成功", &text);
 
                         match dict.translate(&text) {
                             Ok(Some(res)) => {
+                                show_notify("查询成功", &res.translation); // 加这行
                                 let mut st = state_clone.lock().unwrap();
                                 st.current_result = Some(res);
                                 st.is_window_visible = true;
                                 drop(st);
 
-                                let pos = egui::pos2(up_x as f32 + 15.0, up_y as f32 + 15.0);
-                                ctx_clone
-                                    .send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
-                                ctx_clone.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                                ctx_clone.send_viewport_cmd(egui::ViewportCommand::Focus);
                                 ctx_clone.request_repaint();
                             }
-                            Ok(None) => {}
+                            Ok(None) => {
+                                show_notify("查询结果", "词库里没有这个词"); // 加这行
+                            }
                             Err(e) => show_notify("查询错误", &e.to_string()),
                         }
                     } else {

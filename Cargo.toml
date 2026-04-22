@@ -7,7 +7,7 @@ edition = "2024"
 eframe = "0.26"
 egui = "0.26"
 arboard = "3.3"
-enigo = "0.1"
+enigo = "0.2"
 rdev = "0.5"
 tray-icon = "0.13"
 rusqlite = { version = "0.31", features = ["bundled"] }

@@ -37,17 +37,12 @@ impl LocalSqliteDict {
         let mut rows = stmt.query([&word])?;
 
         if let Some(row) = rows.next()? {
-            let phonetic: String = row.get(0).unwrap_or_default();
+            let phonetic: Option<String> = row.get(0).unwrap_or(None);
             let translation: String = row.get(1).unwrap_or_default();
 
             Ok(Some(TranslateResult {
                 source_text: text.to_string(),
-                phonetic: if phonetic.is_empty() {
-                    None
-                } else {
-                    Some(phonetic)
-                },
-                // 替换词库中可能存在的换行符转义
+                phonetic: phonetic.filter(|s| !s.is_empty()),
                 translation: translation.replace("\\n", "\n").replace("\\r", ""),
             }))
         } else {

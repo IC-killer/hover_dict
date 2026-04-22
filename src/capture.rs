@@ -1,43 +1,43 @@
 use arboard::Clipboard;
-use enigo::{Enigo, Key, KeyboardControllable};
 use std::thread;
 use std::time::Duration;
 
+#[cfg(not(target_os = "macos"))]
+use enigo::{Direction, Enigo, Key, Keyboard, Settings};
+
+#[cfg(target_os = "macos")]
+use enigo::{Direction, Enigo, Key, Keyboard, Settings};
+
 pub fn capture_selected_text() -> Option<String> {
     let mut clipboard = Clipboard::new().ok()?;
-
     let backup_text = clipboard.get_text().unwrap_or_default();
     let backup_image = clipboard.get_image().ok();
 
-    let mut enigo = Enigo::new();
+    let mut enigo = Enigo::new(&Settings::default()).ok()?;
 
-    // 给系统一点时间反应用户的鼠标抬起动作
     thread::sleep(Duration::from_millis(50));
 
-    // 稳健地发送 Ctrl + C
     #[cfg(target_os = "macos")]
     {
-        enigo.key_down(Key::Meta);
+        let _ = enigo.key(Key::Meta, Direction::Press);
         thread::sleep(Duration::from_millis(20));
-        enigo.key_click(Key::Layout('c'));
+        let _ = enigo.key(Key::Unicode('c'), Direction::Click);
         thread::sleep(Duration::from_millis(20));
-        enigo.key_up(Key::Meta);
+        let _ = enigo.key(Key::Meta, Direction::Release);
     }
     #[cfg(not(target_os = "macos"))]
     {
-        enigo.key_down(Key::Control);
+        let _ = enigo.key(Key::Control, Direction::Press);
         thread::sleep(Duration::from_millis(20));
-        enigo.key_click(Key::Layout('c'));
+        let _ = enigo.key(Key::Unicode('c'), Direction::Click);
         thread::sleep(Duration::from_millis(20));
-        enigo.key_up(Key::Control);
+        let _ = enigo.key(Key::Control, Direction::Release);
     }
 
-    // 【智能重试机制】：最多等待 300ms (6次 * 50ms)
     let mut selected_text = String::new();
     for _ in 0..6 {
         thread::sleep(Duration::from_millis(50));
         if let Ok(text) = clipboard.get_text() {
-            // 如果剪贴板内容变化了，说明复制成功！
             if text != backup_text && !text.is_empty() {
                 selected_text = text;
                 break;
@@ -45,7 +45,7 @@ pub fn capture_selected_text() -> Option<String> {
         }
     }
 
-    // 恢复剪贴板原状
+    // 恢复剪贴板
     if let Some(img) = backup_image {
         let _ = clipboard.set_image(img);
     } else if !backup_text.is_empty() {
@@ -54,10 +54,10 @@ pub fn capture_selected_text() -> Option<String> {
         let _ = clipboard.clear();
     }
 
-    let trimmed = selected_text.trim();
+    let trimmed = selected_text.trim().to_string();
     if trimmed.is_empty() || trimmed.len() > 150 || trimmed.contains('\n') {
         None
     } else {
-        Some(trimmed.to_string())
+        Some(trimmed)
     }
 }
