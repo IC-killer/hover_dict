@@ -94,7 +94,9 @@ impl eframe::App for HoverDictApp {
             // 采用更稳健的策略：窗口始终存在，但默认移到屏幕外 + 缩成 1x1。
             // 注意：MousePassthrough 在部分 Windows 环境下配合透明窗口/连点会导致窗口消息异常（表现为卡死），因此不用它。
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(1.0, 1.0)));
-            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(-10_000.0, -10_000.0)));
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+                -10_000.0, -10_000.0,
+            )));
             self.is_first_frame = false;
             self.last_visible = false;
         }
@@ -127,7 +129,9 @@ impl eframe::App for HoverDictApp {
         // 只在“显示 -> 隐藏”的那一刻把窗口挪走/缩小/穿透
         if !is_window_visible && self.last_visible {
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(1.0, 1.0)));
-            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(-10_000.0, -10_000.0)));
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+                -10_000.0, -10_000.0,
+            )));
         }
 
         if is_window_visible {
@@ -237,7 +241,7 @@ fn main() -> eframe::Result<()> {
                     if let Some(text) = capture_selected_text() {
                         match dict.translate(&text) {
                             Ok(Some(res)) => {
-                                show_notify("查询成功", &res.translation); // 弹出通知
+                                // show_notify("查询成功", &res.translation); // 弹出通知
                                 let mut st = state_clone.lock().unwrap(); // 锁住状态
                                 st.current_result = Some(res); // 设置翻译结果
                                 st.is_window_visible = true; // 设置窗口可见
@@ -290,8 +294,12 @@ fn main() -> eframe::Result<()> {
                         if let Ok(mut st) = state_for_hook.lock() {
                             st.is_window_visible = false;
                         }
-                        ctx_for_hook.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(1.0, 1.0)));
-                        ctx_for_hook.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(-10_000.0, -10_000.0)));
+                        ctx_for_hook.send_viewport_cmd(egui::ViewportCommand::InnerSize(
+                            egui::vec2(1.0, 1.0),
+                        ));
+                        ctx_for_hook.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
+                            egui::pos2(-10_000.0, -10_000.0),
+                        ));
                         ctx_for_hook.request_repaint();
                     }
                     _ => {}
