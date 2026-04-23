@@ -13,3 +13,7 @@ tray-icon = "0.13"
 rusqlite = { version = "0.31", features = ["bundled"] }
 notify-rust = "4.10"
 crossbeam-channel = "0.5"
+image = "0.25.10"
+
+[build-dependencies]
+winres = "0.1.12"

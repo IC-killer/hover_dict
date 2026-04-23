@@ -1,4 +1,5 @@
-// #![windows_subsystem = "windows"]
+#![windows_subsystem = "windows"]
+
 mod capture;
 mod translator;
 
@@ -24,29 +25,44 @@ pub fn show_notify(title: &str, body: &str) {
     let _ = Notification::new().summary(title).body(body).show();
 }
 
-fn generate_cat_icon() -> Icon {
-    let mut rgba = vec![0u8; 16 * 16 * 4];
-    for y in 0..16 {
-        for x in 0..16 {
-            let i = (y * 16 + x) * 4;
-            if (y > 2 && y < 14 && x > 2 && x < 14)
-                || (y <= 4 && (x == 3 || x == 4 || x == 11 || x == 12))
-            {
-                rgba[i] = 255;
-                rgba[i + 1] = 165;
-                rgba[i + 2] = 0;
-                rgba[i + 3] = 255;
-                if y == 7 && (x == 5 || x == 10) {
-                    rgba[i] = 0;
-                    rgba[i + 1] = 0;
-                    rgba[i + 2] = 0;
-                    rgba[i + 3] = 255;
-                }
-            }
-        }
-    }
-    Icon::from_rgba(rgba, 16, 16).unwrap()
+fn get_cat_icon() -> Icon {
+    // include_bytes! 会在编译时将文件内容打包进可执行文件内存中
+    let icon_bytes = include_bytes!("../icon.ico");
+
+    // 解析图片
+    let image = image::load_from_memory(icon_bytes)
+        .expect("Failed to open icon path")
+        .into_rgba8();
+
+    let (width, height) = image.dimensions();
+    let rgba = image.into_raw();
+
+    Icon::from_rgba(rgba, width, height).unwrap()
 }
+
+// fn generate_cat_icon() -> Icon {
+//     let mut rgba = vec![0u8; 16 * 16 * 4];
+//     for y in 0..16 {
+//         for x in 0..16 {
+//             let i = (y * 16 + x) * 4;
+//             if (y > 2 && y < 14 && x > 2 && x < 14)
+//                 || (y <= 4 && (x == 3 || x == 4 || x == 11 || x == 12))
+//             {
+//                 rgba[i] = 255;
+//                 rgba[i + 1] = 165;
+//                 rgba[i + 2] = 0;
+//                 rgba[i + 3] = 255;
+//                 if y == 7 && (x == 5 || x == 10) {
+//                     rgba[i] = 0;
+//                     rgba[i + 1] = 0;
+//                     rgba[i + 2] = 0;
+//                     rgba[i + 3] = 255;
+//                 }
+//             }
+//         }
+//     }
+//     Icon::from_rgba(rgba, 16, 16).unwrap()
+// }
 
 // 采用更稳健的黑体 TTF 格式，避免 TTC 解析错误导致 UI 引擎死掉
 fn setup_custom_fonts(ctx: &egui::Context) {
@@ -196,7 +212,7 @@ fn main() -> eframe::Result<()> {
 
     let tray_icon = TrayIconBuilder::new()
         .with_menu(Box::new(tray_menu))
-        .with_icon(generate_cat_icon())
+        .with_icon(get_cat_icon())
         .build()
         .unwrap();
 
