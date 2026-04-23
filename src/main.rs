@@ -245,7 +245,7 @@ fn build_tray_menu(is_capture_enabled: bool, is_llm_enabled: bool, config: &Mode
     let toggle_capture = CheckMenuItem::with_id("toggle_capture", "开启划词翻译", true, is_capture_enabled, None);
     let toggle_llm = CheckMenuItem::with_id("toggle_llm", "开启大模型翻译", true, is_llm_enabled, None);
     
-    let model_menu = Submenu::new("选择模型", true);
+    let mut model_items = Vec::new();
     for model in &config.models {
         let is_active = model.id == config.active_model;
         let item = CheckMenuItem::with_id(
@@ -255,8 +255,11 @@ fn build_tray_menu(is_capture_enabled: bool, is_llm_enabled: bool, config: &Mode
             is_active, 
             None
         );
-        let _ = model_menu.append(&item);
+        model_items.push(item);
     }
+    
+    let refs: Vec<&dyn tray_icon::menu::IsMenuItem> = model_items.iter().map(|i| i as &dyn tray_icon::menu::IsMenuItem).collect();
+    let model_menu = Submenu::with_items("选择模型", true, &refs).unwrap_or_else(|_| Submenu::new("选择模型", true));
 
     let quit_item = MenuItem::with_id("quit", "彻底退出", true, None);
     
