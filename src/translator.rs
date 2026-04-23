@@ -74,12 +74,21 @@ impl ModelsConfig {
             active_model: "tencent/Hunyuan-MT-7B".to_string(),
             api_endpoint: "https://api.siliconflow.cn/v1/chat/completions".to_string(),
             api_key_env_var: "SILICONFLOW_API_KEY".to_string(),
-            models: vec![],
+            models: vec![
+                ModelItem { id: "tencent/Hunyuan-MT-7B".to_string(), name: "混元 7B (SiliconFlow)".to_string() },
+                ModelItem { id: "Qwen/Qwen2.5-7B-Instruct".to_string(), name: "通义千问 2.5 (SiliconFlow)".to_string() },
+            ],
         };
         
         match fs::read_to_string("models.json") {
-            Ok(content) => serde_json::from_str(&content).unwrap_or(default_config),
-            Err(_) => default_config,
+            Ok(content) => serde_json::from_str(&content).unwrap_or_else(|_| {
+                default_config.save();
+                default_config
+            }),
+            Err(_) => {
+                default_config.save();
+                default_config
+            }
         }
     }
 

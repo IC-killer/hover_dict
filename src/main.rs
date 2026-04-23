@@ -99,6 +99,7 @@ struct HoverDictApp {
     is_capture_enabled: Arc<Mutex<bool>>,
     is_llm_enabled: Arc<Mutex<bool>>,
     _tray_icon: tray_icon::TrayIcon,
+    _tray_menu_state: TrayMenuState,
     is_first_frame: bool,
     last_visible: bool,
 }
@@ -115,24 +116,27 @@ impl eframe::App for HoverDictApp {
                 show_notify("划词翻译", if *enabled { "已开启" } else { "已关闭" });
                 
                 let config = ModelsConfig::load();
-                let menu = build_tray_menu(*enabled, *self.is_llm_enabled.lock().unwrap(), &config);
-                self._tray_icon.set_menu(Some(Box::new(menu)));
+                let menu_state = build_tray_menu(*enabled, *self.is_llm_enabled.lock().unwrap(), &config);
+                self._tray_icon.set_menu(Some(Box::new(menu_state.menu.clone())));
+                self._tray_menu_state = menu_state;
             } else if id == "toggle_llm" {
                 let mut enabled = self.is_llm_enabled.lock().unwrap();
                 *enabled = !*enabled;
                 show_notify("大模型翻译", if *enabled { "已开启" } else { "已关闭" });
                 
                 let config = ModelsConfig::load();
-                let menu = build_tray_menu(*self.is_capture_enabled.lock().unwrap(), *enabled, &config);
-                self._tray_icon.set_menu(Some(Box::new(menu)));
+                let menu_state = build_tray_menu(*self.is_capture_enabled.lock().unwrap(), *enabled, &config);
+                self._tray_icon.set_menu(Some(Box::new(menu_state.menu.clone())));
+                self._tray_menu_state = menu_state;
             } else if id.starts_with("model_") {
                 let selected_id = id.trim_start_matches("model_");
                 let mut config = ModelsConfig::load();
                 config.active_model = selected_id.to_string();
                 config.save();
                 
-                let menu = build_tray_menu(*self.is_capture_enabled.lock().unwrap(), *self.is_llm_enabled.lock().unwrap(), &config);
-                self._tray_icon.set_menu(Some(Box::new(menu)));
+                let menu_state = build_tray_menu(*self.is_capture_enabled.lock().unwrap(), *self.is_llm_enabled.lock().unwrap(), &config);
+                self._tray_icon.set_menu(Some(Box::new(menu_state.menu.clone())));
+                self._tray_menu_state = menu_state;
             }
         }
 
@@ -240,38 +244,56 @@ impl eframe::App for HoverDictApp {
     }
 }
 
-fn build_tray_menu(is_capture_enabled: bool, is_llm_enabled: bool, config: &ModelsConfig) -> Menu {
+struct TrayMenuState {
+    pub menu: Menu,
+    _toggle_capture: CheckMenuItem,
+    _toggle_llm: CheckMenuItem,
+    _model_menu: Submenu,
+    _model_items: Vec<MenuItem>,
+    _separator: PredefinedMenuItem,
+    _quit_item: MenuItem,
+}
+
+fn build_tray_menu(is_capture_enabled: bool, is_llm_enabled: bool, config: &ModelsConfig) -> TrayMenuState {
     let tray_menu = Menu::new();
     let toggle_capture = CheckMenuItem::with_id("toggle_capture", "开启划词翻译", true, is_capture_enabled, None);
     let toggle_llm = CheckMenuItem::with_id("toggle_llm", "开启大模型翻译", true, is_llm_enabled, None);
     
     let mut model_items = Vec::new();
+    let model_menu = Submenu::new("选择模型", true);
     for model in &config.models {
         let is_active = model.id == config.active_model;
-        let item = CheckMenuItem::with_id(
+        let prefix = if is_active { "√ " } else { "  " };
+        let item = MenuItem::with_id(
             format!("model_{}", model.id), 
-            model.name.clone(), 
+            format!("{}{}", prefix, model.name), 
             true, 
-            is_active, 
             None
         );
+        let _ = model_menu.append(&item);
         model_items.push(item);
     }
-    
-    let refs: Vec<&dyn tray_icon::menu::IsMenuItem> = model_items.iter().map(|i| i as &dyn tray_icon::menu::IsMenuItem).collect();
-    let model_menu = Submenu::with_items("选择模型", true, &refs).unwrap_or_else(|_| Submenu::new("选择模型", true));
 
     let quit_item = MenuItem::with_id("quit", "彻底退出", true, None);
+    let separator = PredefinedMenuItem::separator();
     
     let _ = tray_menu.append_items(&[
         &toggle_capture, 
         &toggle_llm, 
         &model_menu, 
-        &PredefinedMenuItem::separator(), 
+        &separator, 
         &quit_item
     ]);
     
-    tray_menu
+    TrayMenuState {
+        menu: tray_menu,
+        _toggle_capture: toggle_capture,
+        _toggle_llm: toggle_llm,
+        _model_menu: model_menu,
+        _model_items: model_items,
+        _separator: separator,
+        _quit_item: quit_item,
+    }
 }
 
 fn main() -> eframe::Result<()> {
@@ -290,10 +312,10 @@ fn main() -> eframe::Result<()> {
     }));
 
     let config = ModelsConfig::load();
-    let tray_menu = build_tray_menu(true, true, &config);
+    let tray_menu_state = build_tray_menu(true, true, &config);
 
     let tray_icon = TrayIconBuilder::new()
-        .with_menu(Box::new(tray_menu))
+        .with_menu(Box::new(tray_menu_state.menu.clone()))
         .with_icon(get_cat_icon())
         .build()
         .unwrap();
@@ -431,6 +453,7 @@ fn main() -> eframe::Result<()> {
                 is_capture_enabled,
                 is_llm_enabled,
                 _tray_icon: tray_icon,
+                _tray_menu_state: tray_menu_state,
                 is_first_frame: true,
                 last_visible: false,
             })
