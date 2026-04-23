@@ -68,22 +68,37 @@ fn get_cat_icon() -> Icon {
 
 fn setup_custom_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
-    if let Ok(font_data) = std::fs::read("C:\\Windows\\Fonts\\simhei.ttf") {
-        fonts.font_data.insert(
-            "chinese_font".to_owned(),
-            egui::FontData::from_owned(font_data),
-        );
-        fonts
-            .families
-            .entry(egui::FontFamily::Proportional)
-            .or_default()
-            .insert(0, "chinese_font".to_owned());
-        fonts
-            .families
-            .entry(egui::FontFamily::Monospace)
-            .or_default()
-            .insert(0, "chinese_font".to_owned());
+    
+    let has_segoe = if let Ok(font_data) = std::fs::read("C:\\Windows\\Fonts\\segoeui.ttf") {
+        fonts.font_data.insert("segoeui".to_owned(), egui::FontData::from_owned(font_data));
+        true
+    } else { false };
+
+    let has_yahei = if let Ok(font_data) = std::fs::read("C:\\Windows\\Fonts\\msyh.ttf") {
+        fonts.font_data.insert("msyh".to_owned(), egui::FontData::from_owned(font_data));
+        true
+    } else { false };
+
+    let has_simhei = if !has_yahei {
+        if let Ok(font_data) = std::fs::read("C:\\Windows\\Fonts\\simhei.ttf") {
+            fonts.font_data.insert("simhei".to_owned(), egui::FontData::from_owned(font_data));
+            true
+        } else { false }
+    } else { false };
+
+    if has_segoe {
+        fonts.families.entry(egui::FontFamily::Proportional).or_default().insert(0, "segoeui".to_owned());
+        fonts.families.entry(egui::FontFamily::Monospace).or_default().insert(0, "segoeui".to_owned());
     }
+    
+    if has_yahei {
+        fonts.families.entry(egui::FontFamily::Proportional).or_default().push("msyh".to_owned());
+        fonts.families.entry(egui::FontFamily::Monospace).or_default().push("msyh".to_owned());
+    } else if has_simhei {
+        fonts.families.entry(egui::FontFamily::Proportional).or_default().push("simhei".to_owned());
+        fonts.families.entry(egui::FontFamily::Monospace).or_default().push("simhei".to_owned());
+    }
+
     ctx.set_fonts(fonts);
 }
 

@@ -30,8 +30,8 @@ impl LocalSqliteDict {
         let conn = Connection::open_with_flags(&self.db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         let word = text.trim().to_lowercase();
 
-        let query = "SELECT phonetic, translation FROM dictionary WHERE word = ? LIMIT 1";
-        let query_fallback = "SELECT phonetic, translation FROM stardict WHERE word = ? LIMIT 1";
+        let query = "SELECT phonetic, translation, exchange FROM dictionary WHERE word = ? LIMIT 1";
+        let query_fallback = "SELECT phonetic, translation, exchange FROM stardict WHERE word = ? LIMIT 1";
 
         let mut stmt = conn
             .prepare(query)
@@ -39,8 +39,29 @@ impl LocalSqliteDict {
         let mut rows = stmt.query([&word])?;
 
         if let Some(row) = rows.next()? {
-            let phonetic: Option<String> = row.get(0).unwrap_or(None);
+            let mut phonetic: Option<String> = row.get(0).unwrap_or(None);
             let translation: String = row.get(1).unwrap_or_default();
+            let exchange: Option<String> = row.get::<usize, Option<String>>(2).unwrap_or(None);
+
+            if phonetic.as_deref().unwrap_or("").trim().is_empty() {
+                if let Some(exch) = exchange {
+                    for part in exch.split('/') {
+                        if let Some(lemma) = part.strip_prefix("0:") {
+                            if let Ok(mut lemma_stmt) = conn.prepare("SELECT phonetic FROM stardict WHERE word = ? LIMIT 1") {
+                                if let Ok(mut lemma_rows) = lemma_stmt.query([lemma]) {
+                                    if let Ok(Some(lemma_row)) = lemma_rows.next() {
+                                        let lemma_phonetic: Option<String> = lemma_row.get(0).unwrap_or(None);
+                                        if !lemma_phonetic.as_deref().unwrap_or("").trim().is_empty() {
+                                            phonetic = lemma_phonetic;
+                                        }
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
 
             Ok(Some(TranslateResult {
                 source_text: text.to_string(),
