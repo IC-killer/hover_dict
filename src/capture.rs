@@ -9,6 +9,19 @@ use enigo::{Direction, Enigo, Key, Keyboard, Settings};
 use enigo::{Direction, Enigo, Key, Keyboard, Settings};
 
 pub fn capture_selected_text() -> Option<String> {
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{GetCursorInfo, CURSORINFO, IDC_IBEAM, LoadCursorW};
+        let mut ci: CURSORINFO = unsafe { std::mem::zeroed() };
+        ci.cbSize = std::mem::size_of::<CURSORINFO>() as u32;
+        if unsafe { GetCursorInfo(&mut ci) } != 0 {
+            let ibeam = unsafe { LoadCursorW(0 as _, IDC_IBEAM) };
+            if ci.hCursor != ibeam {
+                return None; // 仅在光标为文本选择模式（I-beam）时抓取，避免干扰截图工具
+            }
+        }
+    }
+
     let mut clipboard = Clipboard::new().ok()?;
     let backup_text = clipboard.get_text().unwrap_or_default();
     let backup_image = clipboard.get_image().ok();
@@ -59,7 +72,7 @@ pub fn capture_selected_text() -> Option<String> {
     }
 
     let trimmed = selected_text.trim().to_string();
-    if trimmed.is_empty() || trimmed.len() > 150 || trimmed.contains('\n') {
+    if trimmed.is_empty() || trimmed.len() > 2000 {
         None
     } else {
         Some(trimmed)

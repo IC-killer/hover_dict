@@ -14,6 +14,11 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 notify-rust = "4.10"
 crossbeam-channel = "0.5"
 image = "0.25.10"
+raw-window-handle = "0.6"
+windows-sys = { version = "0.48", features = ["Win32_UI_WindowsAndMessaging"] }
+reqwest = { version = "0.13.2", features = ["blocking", "json"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
 
 [build-dependencies]
 winres = "0.1.12"

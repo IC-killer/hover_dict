@@ -1,0 +1,15 @@
+{
+  "active_model": "tencent/Hunyuan-MT-7B",
+  "api_endpoint": "https://api.siliconflow.cn/v1/chat/completions",
+  "api_key_env_var": "SILICONFLOW_API_KEY",
+  "models": [
+    {
+      "id": "tencent/Hunyuan-MT-7B",
+      "name": "混元 7B (SiliconFlow)"
+    },
+    {
+      "id": "Qwen/Qwen2.5-7B-Instruct",
+      "name": "通义千问 2.5 (SiliconFlow)"
+    }
+  ]
+}

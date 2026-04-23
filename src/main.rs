@@ -12,11 +12,40 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
-use translator::{LocalSqliteDict, TranslateResult};
+use translator::{LocalSqliteDict, LlmTranslator, ModelsConfig, TranslateResult};
 use tray_icon::{
     Icon, TrayIconBuilder,
-    menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem},
+    menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu},
 };
+
+#[cfg(windows)]
+fn hide_window_from_taskbar(frame: &eframe::Frame) {
+    use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GWL_EXSTYLE, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_EX_APPWINDOW,
+        WS_EX_TOOLWINDOW, GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos,
+    };
+
+    let Ok(handle) = frame.window_handle() else { return };
+    let RawWindowHandle::Win32(handle) = handle.as_raw() else { return };
+    let hwnd = handle.hwnd.get();
+
+    unsafe {
+        let mut ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        ex_style |= WS_EX_TOOLWINDOW as isize;
+        ex_style &= !(WS_EX_APPWINDOW as isize);
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_style);
+        SetWindowPos(
+            hwnd,
+            0,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
+        );
+    }
+}
 
 static MOUSE_X: AtomicI32 = AtomicI32::new(0);
 static MOUSE_Y: AtomicI32 = AtomicI32::new(0);
@@ -26,10 +55,7 @@ pub fn show_notify(title: &str, body: &str) {
 }
 
 fn get_cat_icon() -> Icon {
-    // include_bytes! 会在编译时将文件内容打包进可执行文件内存中
     let icon_bytes = include_bytes!("../icon.ico");
-
-    // 解析图片
     let image = image::load_from_memory(icon_bytes)
         .expect("Failed to open icon path")
         .into_rgba8();
@@ -40,31 +66,6 @@ fn get_cat_icon() -> Icon {
     Icon::from_rgba(rgba, width, height).unwrap()
 }
 
-// fn generate_cat_icon() -> Icon {
-//     let mut rgba = vec![0u8; 16 * 16 * 4];
-//     for y in 0..16 {
-//         for x in 0..16 {
-//             let i = (y * 16 + x) * 4;
-//             if (y > 2 && y < 14 && x > 2 && x < 14)
-//                 || (y <= 4 && (x == 3 || x == 4 || x == 11 || x == 12))
-//             {
-//                 rgba[i] = 255;
-//                 rgba[i + 1] = 165;
-//                 rgba[i + 2] = 0;
-//                 rgba[i + 3] = 255;
-//                 if y == 7 && (x == 5 || x == 10) {
-//                     rgba[i] = 0;
-//                     rgba[i + 1] = 0;
-//                     rgba[i + 2] = 0;
-//                     rgba[i + 3] = 255;
-//                 }
-//             }
-//         }
-//     }
-//     Icon::from_rgba(rgba, 16, 16).unwrap()
-// }
-
-// 采用更稳健的黑体 TTF 格式，避免 TTC 解析错误导致 UI 引擎死掉
 fn setup_custom_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     if let Ok(font_data) = std::fs::read("C:\\Windows\\Fonts\\simhei.ttf") {
@@ -89,26 +90,56 @@ fn setup_custom_fonts(ctx: &egui::Context) {
 struct SharedState {
     current_result: Option<TranslateResult>,
     is_window_visible: bool,
-    // 来自鼠标钩子的屏幕像素坐标（physical pixels），需要在 egui 中换算为 logical points。
     pending_pos: Option<(i32, i32)>,
     shown_at: Option<Instant>,
 }
 
 struct HoverDictApp {
     shared_state: Arc<Mutex<SharedState>>,
+    is_capture_enabled: Arc<Mutex<bool>>,
+    is_llm_enabled: Arc<Mutex<bool>>,
     _tray_icon: tray_icon::TrayIcon,
     is_first_frame: bool,
-    // 只在状态变化时发送窗口命令，避免每帧 OuterPosition/InnerSize 导致卡死
     last_visible: bool,
 }
 
 impl eframe::App for HoverDictApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        if let Ok(event) = MenuEvent::receiver().try_recv() {
+            let id = event.id.0.as_str();
+            if id == "quit" {
+                std::process::exit(0);
+            } else if id == "toggle_capture" {
+                let mut enabled = self.is_capture_enabled.lock().unwrap();
+                *enabled = !*enabled;
+                show_notify("划词翻译", if *enabled { "已开启" } else { "已关闭" });
+                
+                let config = ModelsConfig::load();
+                let menu = build_tray_menu(*enabled, *self.is_llm_enabled.lock().unwrap(), &config);
+                self._tray_icon.set_menu(Some(Box::new(menu)));
+            } else if id == "toggle_llm" {
+                let mut enabled = self.is_llm_enabled.lock().unwrap();
+                *enabled = !*enabled;
+                show_notify("大模型翻译", if *enabled { "已开启" } else { "已关闭" });
+                
+                let config = ModelsConfig::load();
+                let menu = build_tray_menu(*self.is_capture_enabled.lock().unwrap(), *enabled, &config);
+                self._tray_icon.set_menu(Some(Box::new(menu)));
+            } else if id.starts_with("model_") {
+                let selected_id = id.trim_start_matches("model_");
+                let mut config = ModelsConfig::load();
+                config.active_model = selected_id.to_string();
+                config.save();
+                
+                let menu = build_tray_menu(*self.is_capture_enabled.lock().unwrap(), *self.is_llm_enabled.lock().unwrap(), &config);
+                self._tray_icon.set_menu(Some(Box::new(menu)));
+            }
+        }
+
         if self.is_first_frame {
-            // 不要把根窗口设为 Visible(false)：
-            // 在 Windows 上根窗口隐藏后，可能不会再驱动 update，从而无法“再显示”弹窗。
-            // 采用更稳健的策略：窗口始终存在，但默认移到屏幕外 + 缩成 1x1。
-            // 注意：MousePassthrough 在部分 Windows 环境下配合透明窗口/连点会导致窗口消息异常（表现为卡死），因此不用它。
+            #[cfg(windows)]
+            hide_window_from_taskbar(frame);
+
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(1.0, 1.0)));
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
                 -10_000.0, -10_000.0,
@@ -117,9 +148,9 @@ impl eframe::App for HoverDictApp {
             self.last_visible = false;
         }
 
-        // 注意：不要在整个 update() 周期持有 Mutex。
-        // 否则后台线程（划词/查询）一旦也需要拿锁，就可能造成 UI 线程阻塞，
-        // 表现为窗口“未响应”，连 Esc/鼠标也失效。
+        #[cfg(windows)]
+        hide_window_from_taskbar(frame);
+
         let (pending_pos, is_window_visible, current_result, _shown_at) = {
             let mut state = self.shared_state.lock().unwrap();
             (
@@ -130,7 +161,6 @@ impl eframe::App for HoverDictApp {
             )
         };
 
-        // 只在“隐藏 -> 显示”的那一刻设置位置/大小/穿透/焦点
         if is_window_visible && !self.last_visible {
             if let Some((px, py)) = pending_pos {
                 let ppp = ctx.pixels_per_point();
@@ -138,11 +168,14 @@ impl eframe::App for HoverDictApp {
                 let y = py as f32 / ppp;
                 ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(x, y)));
             }
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(300.0, 200.0)));
-            // 不强制抢焦点：交互关闭改用按钮/全局 Esc 兜底，避免透明置顶窗口在频繁点击时出现焦点/事件异常。
+            let size = if current_result.as_ref().map(|r| r.is_llm).unwrap_or(false) {
+                egui::vec2(400.0, 300.0)
+            } else {
+                egui::vec2(300.0, 200.0)
+            };
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
         }
 
-        // 只在“显示 -> 隐藏”的那一刻把窗口挪走/缩小/穿透
         if !is_window_visible && self.last_visible {
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(1.0, 1.0)));
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
@@ -158,7 +191,6 @@ impl eframe::App for HoverDictApp {
                         .rounding(8.0),
                 )
                 .show(ctx, |ui| {
-                    // 显式关闭按钮（比“点击外部关闭”稳定）
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                         if ui.button("×").clicked() {
                             if let Ok(mut st) = self.shared_state.lock() {
@@ -168,27 +200,75 @@ impl eframe::App for HoverDictApp {
                     });
 
                     if let Some(res) = &current_result {
-                        ui.heading(
-                            egui::RichText::new(&res.source_text).color(egui::Color32::BLACK),
-                        );
-                        if let Some(phonetic) = &res.phonetic {
+                        if res.is_llm {
+                            ui.heading(
+                                egui::RichText::new("大模型翻译").color(egui::Color32::from_rgb(0, 100, 200)),
+                            );
+                            ui.separator();
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new(&res.translation)
+                                        .size(15.0)
+                                        .color(egui::Color32::from_rgb(40, 40, 40)),
+                                );
+                            });
+                        } else {
+                            ui.heading(
+                                egui::RichText::new(&res.source_text).color(egui::Color32::BLACK),
+                            );
+                            if let Some(phonetic) = &res.phonetic {
+                                ui.label(
+                                    egui::RichText::new(format!("[{}]", phonetic))
+                                        .color(egui::Color32::GRAY),
+                                );
+                            }
+                            ui.separator();
                             ui.label(
-                                egui::RichText::new(format!("[{}]", phonetic))
-                                    .color(egui::Color32::GRAY),
+                                egui::RichText::new(&res.translation)
+                                    .size(14.0)
+                                    .color(egui::Color32::from_rgb(40, 40, 40)),
                             );
                         }
-                        ui.separator();
-                        ui.label(
-                            egui::RichText::new(&res.translation)
-                                .size(14.0)
-                                .color(egui::Color32::from_rgb(40, 40, 40)),
-                        );
                     }
                 });
         }
 
         self.last_visible = is_window_visible;
+        
+        // Ensure continuous polling for menu events
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
+}
+
+fn build_tray_menu(is_capture_enabled: bool, is_llm_enabled: bool, config: &ModelsConfig) -> Menu {
+    let tray_menu = Menu::new();
+    let toggle_capture = CheckMenuItem::with_id("toggle_capture", "开启划词翻译", true, is_capture_enabled, None);
+    let toggle_llm = CheckMenuItem::with_id("toggle_llm", "开启大模型翻译", true, is_llm_enabled, None);
+    
+    let model_menu = Submenu::new("选择模型", true);
+    for model in &config.models {
+        let is_active = model.id == config.active_model;
+        let item = CheckMenuItem::with_id(
+            format!("model_{}", model.id), 
+            model.name.clone(), 
+            true, 
+            is_active, 
+            None
+        );
+        let _ = model_menu.append(&item);
+    }
+
+    let quit_item = MenuItem::with_id("quit", "彻底退出", true, None);
+    
+    let _ = tray_menu.append_items(&[
+        &toggle_capture, 
+        &toggle_llm, 
+        &model_menu, 
+        &PredefinedMenuItem::separator(), 
+        &quit_item
+    ]);
+    
+    tray_menu
 }
 
 fn main() -> eframe::Result<()> {
@@ -198,6 +278,7 @@ fn main() -> eframe::Result<()> {
     }
 
     let is_capture_enabled = Arc::new(Mutex::new(true));
+    let is_llm_enabled = Arc::new(Mutex::new(true));
     let shared_state = Arc::new(Mutex::new(SharedState {
         current_result: None,
         is_window_visible: false,
@@ -205,10 +286,8 @@ fn main() -> eframe::Result<()> {
         shown_at: None,
     }));
 
-    let tray_menu = Menu::new();
-    let toggle_item = CheckMenuItem::with_id("toggle", "开启划词翻译", true, true, None);
-    let quit_item = MenuItem::with_id("quit", "彻底退出", true, None);
-    let _ = tray_menu.append_items(&[&toggle_item, &PredefinedMenuItem::separator(), &quit_item]);
+    let config = ModelsConfig::load();
+    let tray_menu = build_tray_menu(true, true, &config);
 
     let tray_icon = TrayIconBuilder::new()
         .with_menu(Box::new(tray_menu))
@@ -221,7 +300,6 @@ fn main() -> eframe::Result<()> {
             .with_decorations(false)
             .with_always_on_top()
             .with_transparent(true)
-            // 根窗口保持可见，避免隐藏后无法唤醒
             .with_visible(true)
             .with_inner_size([1.0, 1.0]),
         ..Default::default()
@@ -234,47 +312,70 @@ fn main() -> eframe::Result<()> {
             setup_custom_fonts(&cc.egui_ctx);
             let ctx_clone = cc.egui_ctx.clone();
 
-            let is_enabled_tray = Arc::clone(&is_capture_enabled);
-            thread::spawn(move || {
-                while let Ok(event) = MenuEvent::receiver().recv() {
-                    if event.id.0 == "quit" {
-                        std::process::exit(0);
-                    } else if event.id.0 == "toggle" {
-                        let mut enabled = is_enabled_tray.lock().unwrap();
-                        *enabled = !*enabled;
-                        show_notify("划词翻译", if *enabled { "已开启" } else { "已关闭" });
-                    }
-                }
-            });
-
             let (capture_tx, capture_rx) = unbounded::<(i32, i32)>();
 
             let state_clone = Arc::clone(&shared_state);
+            let is_llm_for_thread = Arc::clone(&is_llm_enabled);
+            
             thread::spawn(move || {
                 let dict = LocalSqliteDict::new("dict.db");
 
                 while let Ok((up_x, up_y)) = capture_rx.recv() {
                     if let Some(text) = capture_selected_text() {
-                        match dict.translate(&text) {
-                            Ok(Some(res)) => {
-                                // show_notify("查询成功", &res.translation); // 弹出通知
-                                let mut st = state_clone.lock().unwrap(); // 锁住状态
-                                st.current_result = Some(res); // 设置翻译结果
-                                st.is_window_visible = true; // 设置窗口可见
-                                // 在鼠标抬起位置附近弹出窗口；注意此处是屏幕像素坐标
-                                st.pending_pos = Some((up_x + 12, up_y + 12));
-                                st.shown_at = Some(Instant::now());
-                                drop(st); // 释放锁
-
-                                ctx_clone.request_repaint(); // 请求重新绘制
+                        let config = ModelsConfig::load();
+                        let llm_enabled = *is_llm_for_thread.lock().unwrap();
+                        
+                        let word_count = text.split_whitespace().count();
+                        let has_punct = text.chars().any(|c| c.is_ascii_punctuation() || "，。！？；：".contains(c));
+                        let is_sentence = word_count >= 3 || has_punct;
+                        
+                        let mut final_res = None;
+                        
+                        if !is_sentence {
+                            // 短文本：先查本地词典
+                            if let Ok(Some(res)) = dict.translate(&text) {
+                                final_res = Some(res);
+                            } else if llm_enabled {
+                                // 本地查词失败，且大模型已开启，则走大模型重试
+                                match LlmTranslator::translate(&text, &config) {
+                                    Ok(Some(res)) => final_res = Some(res),
+                                    Err(e) => show_notify("大模型重试失败", &e.to_string()),
+                                    _ => {}
+                                }
                             }
-                            Ok(None) => {
-                                show_notify("查询结果", "词库里没有这个词");
+                        } else {
+                            // 长文本（句子/段落）：优先走大模型
+                            if llm_enabled {
+                                match LlmTranslator::translate(&text, &config) {
+                                    Ok(Some(res)) => final_res = Some(res),
+                                    Err(e) => {
+                                        show_notify("大模型查询失败", &e.to_string());
+                                        // 失败后回退查本地词典
+                                        if let Ok(Some(res)) = dict.translate(&text) {
+                                            final_res = Some(res);
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            } else {
+                                // 大模型未开启，强行查本地词典
+                                if let Ok(Some(res)) = dict.translate(&text) {
+                                    final_res = Some(res);
+                                }
                             }
-                            Err(e) => show_notify("查询错误", &e.to_string()),
                         }
-                    } else {
-                        show_notify("抓取失败", "未能获取选中文本");
+                        
+                        if let Some(res) = final_res {
+                            let mut st = state_clone.lock().unwrap();
+                            st.current_result = Some(res);
+                            st.is_window_visible = true;
+                            st.pending_pos = Some((up_x + 12, up_y + 12));
+                            st.shown_at = Some(Instant::now());
+                            drop(st);
+                            ctx_clone.request_repaint();
+                        } else {
+                            show_notify("查询结果", "翻译失败或词库中没有这个词");
+                        }
                     }
                 }
             });
@@ -305,7 +406,6 @@ fn main() -> eframe::Result<()> {
                             let _ = capture_tx.send((up_x, up_y));
                         }
                     }
-                    // 全局兜底：即使 UI 线程卡住，也能用 Esc 强制隐藏弹窗
                     EventType::KeyPress(rdev::Key::Escape) => {
                         if let Ok(mut st) = state_for_hook.lock() {
                             st.is_window_visible = false;
@@ -325,6 +425,8 @@ fn main() -> eframe::Result<()> {
 
             Box::new(HoverDictApp {
                 shared_state,
+                is_capture_enabled,
+                is_llm_enabled,
                 _tray_icon: tray_icon,
                 is_first_frame: true,
                 last_visible: false,
