@@ -113,6 +113,7 @@ struct HoverDictApp {
     shared_state: Arc<Mutex<SharedState>>,
     is_capture_enabled: Arc<Mutex<bool>>,
     is_llm_enabled: Arc<Mutex<bool>>,
+    is_pinned: Arc<Mutex<bool>>,
     _tray_icon: tray_icon::TrayIcon,
     _tray_menu_state: TrayMenuState,
     is_first_frame: bool,
@@ -131,7 +132,7 @@ impl eframe::App for HoverDictApp {
                 show_notify("划词翻译", if *enabled { "已开启" } else { "已关闭" });
                 
                 let config = ModelsConfig::load();
-                let menu_state = build_tray_menu(*enabled, *self.is_llm_enabled.lock().unwrap(), &config);
+                let menu_state = build_tray_menu(*enabled, *self.is_llm_enabled.lock().unwrap(), *self.is_pinned.lock().unwrap(), &config);
                 self._tray_icon.set_menu(Some(Box::new(menu_state.menu.clone())));
                 self._tray_menu_state = menu_state;
             } else if id == "toggle_llm" {
@@ -140,16 +141,31 @@ impl eframe::App for HoverDictApp {
                 show_notify("大模型翻译", if *enabled { "已开启" } else { "已关闭" });
                 
                 let config = ModelsConfig::load();
-                let menu_state = build_tray_menu(*self.is_capture_enabled.lock().unwrap(), *enabled, &config);
+                let menu_state = build_tray_menu(*self.is_capture_enabled.lock().unwrap(), *enabled, *self.is_pinned.lock().unwrap(), &config);
                 self._tray_icon.set_menu(Some(Box::new(menu_state.menu.clone())));
                 self._tray_menu_state = menu_state;
+            } else if id == "toggle_pin" {
+                let mut pinned = self.is_pinned.lock().unwrap();
+                *pinned = !*pinned;
+                show_notify("翻译窗口置顶", if *pinned { "已开启" } else { "已关闭" });
+                
+                let config = ModelsConfig::load();
+                let menu_state = build_tray_menu(*self.is_capture_enabled.lock().unwrap(), *self.is_llm_enabled.lock().unwrap(), *pinned, &config);
+                self._tray_icon.set_menu(Some(Box::new(menu_state.menu.clone())));
+                self._tray_menu_state = menu_state;
+                
+                // If the window is currently visible, update its window level immediately
+                if self.last_visible {
+                    let window_level = if *pinned { egui::WindowLevel::AlwaysOnTop } else { egui::WindowLevel::Normal };
+                    ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(window_level));
+                }
             } else if id.starts_with("model_") {
                 let selected_id = id.trim_start_matches("model_");
                 let mut config = ModelsConfig::load();
                 config.active_model = selected_id.to_string();
                 config.save();
                 
-                let menu_state = build_tray_menu(*self.is_capture_enabled.lock().unwrap(), *self.is_llm_enabled.lock().unwrap(), &config);
+                let menu_state = build_tray_menu(*self.is_capture_enabled.lock().unwrap(), *self.is_llm_enabled.lock().unwrap(), *self.is_pinned.lock().unwrap(), &config);
                 self._tray_icon.set_menu(Some(Box::new(menu_state.menu.clone())));
                 self._tray_menu_state = menu_state;
             }
@@ -170,17 +186,33 @@ impl eframe::App for HoverDictApp {
         #[cfg(windows)]
         hide_window_from_taskbar(frame);
 
-        let (pending_pos, is_window_visible, current_result, _shown_at) = {
+        let mut is_window_visible = {
+            let state = self.shared_state.lock().unwrap();
+            state.is_window_visible
+        };
+
+        if is_window_visible && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if let Ok(mut st) = self.shared_state.lock() {
+                st.is_window_visible = false;
+            }
+            is_window_visible = false;
+        }
+
+        let (pending_pos, current_result, _shown_at) = {
             let mut state = self.shared_state.lock().unwrap();
             (
                 state.pending_pos.take(),
-                state.is_window_visible,
                 state.current_result.clone(),
                 state.shown_at,
             )
         };
 
         if is_window_visible && !self.last_visible {
+            let pinned = *self.is_pinned.lock().unwrap();
+            let window_level = if pinned { egui::WindowLevel::AlwaysOnTop } else { egui::WindowLevel::Normal };
+            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(window_level));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+
             if let Some((px, py)) = pending_pos {
                 let ppp = ctx.pixels_per_point();
                 let x = px as f32 / ppp;
@@ -263,16 +295,18 @@ struct TrayMenuState {
     pub menu: Menu,
     _toggle_capture: CheckMenuItem,
     _toggle_llm: CheckMenuItem,
+    _toggle_pin: CheckMenuItem,
     _model_menu: Submenu,
     _model_items: Vec<MenuItem>,
     _separator: PredefinedMenuItem,
     _quit_item: MenuItem,
 }
 
-fn build_tray_menu(is_capture_enabled: bool, is_llm_enabled: bool, config: &ModelsConfig) -> TrayMenuState {
+fn build_tray_menu(is_capture_enabled: bool, is_llm_enabled: bool, is_pinned: bool, config: &ModelsConfig) -> TrayMenuState {
     let tray_menu = Menu::new();
     let toggle_capture = CheckMenuItem::with_id("toggle_capture", "开启划词翻译", true, is_capture_enabled, None);
     let toggle_llm = CheckMenuItem::with_id("toggle_llm", "开启大模型翻译", true, is_llm_enabled, None);
+    let toggle_pin = CheckMenuItem::with_id("toggle_pin", "翻译窗口置顶", true, is_pinned, None);
     
     let mut model_items = Vec::new();
     let model_menu = Submenu::new("选择模型", true);
@@ -295,6 +329,7 @@ fn build_tray_menu(is_capture_enabled: bool, is_llm_enabled: bool, config: &Mode
     let _ = tray_menu.append_items(&[
         &toggle_capture, 
         &toggle_llm, 
+        &toggle_pin,
         &model_menu, 
         &separator, 
         &quit_item
@@ -304,6 +339,7 @@ fn build_tray_menu(is_capture_enabled: bool, is_llm_enabled: bool, config: &Mode
         menu: tray_menu,
         _toggle_capture: toggle_capture,
         _toggle_llm: toggle_llm,
+        _toggle_pin: toggle_pin,
         _model_menu: model_menu,
         _model_items: model_items,
         _separator: separator,
@@ -319,6 +355,7 @@ fn main() -> eframe::Result<()> {
 
     let is_capture_enabled = Arc::new(Mutex::new(true));
     let is_llm_enabled = Arc::new(Mutex::new(true));
+    let is_pinned = Arc::new(Mutex::new(false));
     let shared_state = Arc::new(Mutex::new(SharedState {
         current_result: None,
         is_window_visible: false,
@@ -327,7 +364,7 @@ fn main() -> eframe::Result<()> {
     }));
 
     let config = ModelsConfig::load();
-    let tray_menu_state = build_tray_menu(true, true, &config);
+    let tray_menu_state = build_tray_menu(true, true, false, &config);
 
     let tray_icon = TrayIconBuilder::new()
         .with_menu(Box::new(tray_menu_state.menu.clone()))
@@ -338,7 +375,6 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_decorations(false)
-            .with_always_on_top()
             .with_transparent(true)
             .with_visible(true)
             .with_inner_size([1.0, 1.0]),
@@ -467,6 +503,7 @@ fn main() -> eframe::Result<()> {
                 shared_state,
                 is_capture_enabled,
                 is_llm_enabled,
+                is_pinned,
                 _tray_icon: tray_icon,
                 _tray_menu_state: tray_menu_state,
                 is_first_frame: true,
