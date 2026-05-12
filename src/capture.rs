@@ -1,6 +1,6 @@
 use arboard::Clipboard;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(not(target_os = "macos"))]
 use enigo::{Direction, Enigo, Key, Keyboard, Settings};
@@ -9,24 +9,20 @@ use enigo::{Direction, Enigo, Key, Keyboard, Settings};
 use enigo::{Direction, Enigo, Key, Keyboard, Settings};
 
 pub fn capture_selected_text() -> Option<String> {
-    #[cfg(target_os = "windows")]
-    {
-        use windows_sys::Win32::UI::WindowsAndMessaging::{GetCursorInfo, CURSORINFO, IDC_IBEAM, LoadCursorW};
-        let mut ci: CURSORINFO = unsafe { std::mem::zeroed() };
-        ci.cbSize = std::mem::size_of::<CURSORINFO>() as u32;
-        if unsafe { GetCursorInfo(&mut ci) } != 0 {
-            let ibeam = unsafe { LoadCursorW(0 as _, IDC_IBEAM) };
-            if ci.hCursor != ibeam {
-                return None; // 仅在光标为文本选择模式（I-beam）时抓取，避免干扰截图工具
-            }
-        }
-    }
-
     let mut clipboard = Clipboard::new().ok()?;
     let backup_text = clipboard.get_text().unwrap_or_default();
     let backup_image = clipboard.get_image().ok();
 
     let mut enigo = Enigo::new(&Settings::default()).ok()?;
+    let sentinel = format!(
+        "__HOVER_DICT_CLIPBOARD_SENTINEL_{}_{}__",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default()
+    );
+    let sentinel_written = clipboard.set_text(sentinel.clone()).is_ok();
 
     thread::sleep(Duration::from_millis(50));
 
@@ -55,7 +51,12 @@ pub fn capture_selected_text() -> Option<String> {
     for _ in 0..6 {
         thread::sleep(Duration::from_millis(50));
         if let Ok(text) = clipboard.get_text() {
-            if text != backup_text && !text.is_empty() {
+            let changed = if sentinel_written {
+                text != sentinel
+            } else {
+                text != backup_text
+            };
+            if changed && !text.trim().is_empty() {
                 selected_text = text;
                 break;
             }

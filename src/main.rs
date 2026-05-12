@@ -7,27 +7,31 @@ use capture::capture_selected_text;
 use crossbeam_channel::unbounded;
 use eframe::egui;
 use notify_rust::Notification;
-use rdev::{Event, EventType, listen};
+use rdev::{listen, Event, EventType};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
-use translator::{LocalSqliteDict, LlmTranslator, ModelsConfig, TranslateResult};
+use translator::{LlmTranslator, LocalSqliteDict, ModelsConfig, TranslateResult};
 use tray_icon::{
-    Icon, TrayIconBuilder,
     menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu},
+    Icon, TrayIconBuilder,
 };
 
 #[cfg(windows)]
 fn hide_window_from_taskbar(frame: &eframe::Frame) {
     use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GWL_EXSTYLE, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_EX_APPWINDOW,
-        WS_EX_TOOLWINDOW, GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos,
+        GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, SWP_FRAMECHANGED,
+        SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
     };
 
-    let Ok(handle) = frame.window_handle() else { return };
-    let RawWindowHandle::Win32(handle) = handle.as_raw() else { return };
+    let Ok(handle) = frame.window_handle() else {
+        return;
+    };
+    let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+        return;
+    };
     let hwnd = handle.hwnd.get();
 
     unsafe {
@@ -54,6 +58,22 @@ pub fn show_notify(title: &str, body: &str) {
     let _ = Notification::new().summary(title).body(body).show();
 }
 
+fn show_result_window(
+    state: &Arc<Mutex<SharedState>>,
+    ctx: &egui::Context,
+    result: TranslateResult,
+    x: i32,
+    y: i32,
+) {
+    let mut st = state.lock().unwrap();
+    st.current_result = Some(result);
+    st.is_window_visible = true;
+    st.pending_pos = Some((x + 12, y + 12));
+    st.shown_at = Some(Instant::now());
+    drop(st);
+    ctx.request_repaint();
+}
+
 fn get_cat_icon() -> Icon {
     let icon_bytes = include_bytes!("../icon.ico");
     let image = image::load_from_memory(icon_bytes)
@@ -68,35 +88,73 @@ fn get_cat_icon() -> Icon {
 
 fn setup_custom_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
-    
+
     let has_segoe = if let Ok(font_data) = std::fs::read("C:\\Windows\\Fonts\\segoeui.ttf") {
-        fonts.font_data.insert("segoeui".to_owned(), egui::FontData::from_owned(font_data));
+        fonts
+            .font_data
+            .insert("segoeui".to_owned(), egui::FontData::from_owned(font_data));
         true
-    } else { false };
+    } else {
+        false
+    };
 
     let has_yahei = if let Ok(font_data) = std::fs::read("C:\\Windows\\Fonts\\msyh.ttf") {
-        fonts.font_data.insert("msyh".to_owned(), egui::FontData::from_owned(font_data));
+        fonts
+            .font_data
+            .insert("msyh".to_owned(), egui::FontData::from_owned(font_data));
         true
-    } else { false };
+    } else {
+        false
+    };
 
     let has_simhei = if !has_yahei {
         if let Ok(font_data) = std::fs::read("C:\\Windows\\Fonts\\simhei.ttf") {
-            fonts.font_data.insert("simhei".to_owned(), egui::FontData::from_owned(font_data));
+            fonts
+                .font_data
+                .insert("simhei".to_owned(), egui::FontData::from_owned(font_data));
             true
-        } else { false }
-    } else { false };
+        } else {
+            false
+        }
+    } else {
+        false
+    };
 
     if has_segoe {
-        fonts.families.entry(egui::FontFamily::Proportional).or_default().insert(0, "segoeui".to_owned());
-        fonts.families.entry(egui::FontFamily::Monospace).or_default().insert(0, "segoeui".to_owned());
+        fonts
+            .families
+            .entry(egui::FontFamily::Proportional)
+            .or_default()
+            .insert(0, "segoeui".to_owned());
+        fonts
+            .families
+            .entry(egui::FontFamily::Monospace)
+            .or_default()
+            .insert(0, "segoeui".to_owned());
     }
-    
+
     if has_yahei {
-        fonts.families.entry(egui::FontFamily::Proportional).or_default().push("msyh".to_owned());
-        fonts.families.entry(egui::FontFamily::Monospace).or_default().push("msyh".to_owned());
+        fonts
+            .families
+            .entry(egui::FontFamily::Proportional)
+            .or_default()
+            .push("msyh".to_owned());
+        fonts
+            .families
+            .entry(egui::FontFamily::Monospace)
+            .or_default()
+            .push("msyh".to_owned());
     } else if has_simhei {
-        fonts.families.entry(egui::FontFamily::Proportional).or_default().push("simhei".to_owned());
-        fonts.families.entry(egui::FontFamily::Monospace).or_default().push("simhei".to_owned());
+        fonts
+            .families
+            .entry(egui::FontFamily::Proportional)
+            .or_default()
+            .push("simhei".to_owned());
+        fonts
+            .families
+            .entry(egui::FontFamily::Monospace)
+            .or_default()
+            .push("simhei".to_owned());
     }
 
     ctx.set_fonts(fonts);
@@ -130,33 +188,55 @@ impl eframe::App for HoverDictApp {
                 let mut enabled = self.is_capture_enabled.lock().unwrap();
                 *enabled = !*enabled;
                 show_notify("划词翻译", if *enabled { "已开启" } else { "已关闭" });
-                
+
                 let config = ModelsConfig::load();
-                let menu_state = build_tray_menu(*enabled, *self.is_llm_enabled.lock().unwrap(), *self.is_pinned.lock().unwrap(), &config);
-                self._tray_icon.set_menu(Some(Box::new(menu_state.menu.clone())));
+                let menu_state = build_tray_menu(
+                    *enabled,
+                    *self.is_llm_enabled.lock().unwrap(),
+                    *self.is_pinned.lock().unwrap(),
+                    &config,
+                );
+                self._tray_icon
+                    .set_menu(Some(Box::new(menu_state.menu.clone())));
                 self._tray_menu_state = menu_state;
             } else if id == "toggle_llm" {
                 let mut enabled = self.is_llm_enabled.lock().unwrap();
                 *enabled = !*enabled;
                 show_notify("大模型翻译", if *enabled { "已开启" } else { "已关闭" });
-                
+
                 let config = ModelsConfig::load();
-                let menu_state = build_tray_menu(*self.is_capture_enabled.lock().unwrap(), *enabled, *self.is_pinned.lock().unwrap(), &config);
-                self._tray_icon.set_menu(Some(Box::new(menu_state.menu.clone())));
+                let menu_state = build_tray_menu(
+                    *self.is_capture_enabled.lock().unwrap(),
+                    *enabled,
+                    *self.is_pinned.lock().unwrap(),
+                    &config,
+                );
+                self._tray_icon
+                    .set_menu(Some(Box::new(menu_state.menu.clone())));
                 self._tray_menu_state = menu_state;
             } else if id == "toggle_pin" {
                 let mut pinned = self.is_pinned.lock().unwrap();
                 *pinned = !*pinned;
                 show_notify("翻译窗口置顶", if *pinned { "已开启" } else { "已关闭" });
-                
+
                 let config = ModelsConfig::load();
-                let menu_state = build_tray_menu(*self.is_capture_enabled.lock().unwrap(), *self.is_llm_enabled.lock().unwrap(), *pinned, &config);
-                self._tray_icon.set_menu(Some(Box::new(menu_state.menu.clone())));
+                let menu_state = build_tray_menu(
+                    *self.is_capture_enabled.lock().unwrap(),
+                    *self.is_llm_enabled.lock().unwrap(),
+                    *pinned,
+                    &config,
+                );
+                self._tray_icon
+                    .set_menu(Some(Box::new(menu_state.menu.clone())));
                 self._tray_menu_state = menu_state;
-                
+
                 // If the window is currently visible, update its window level immediately
                 if self.last_visible {
-                    let window_level = if *pinned { egui::WindowLevel::AlwaysOnTop } else { egui::WindowLevel::Normal };
+                    let window_level = if *pinned {
+                        egui::WindowLevel::AlwaysOnTop
+                    } else {
+                        egui::WindowLevel::Normal
+                    };
                     ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(window_level));
                 }
             } else if id.starts_with("model_") {
@@ -164,9 +244,15 @@ impl eframe::App for HoverDictApp {
                 let mut config = ModelsConfig::load();
                 config.active_model = selected_id.to_string();
                 config.save();
-                
-                let menu_state = build_tray_menu(*self.is_capture_enabled.lock().unwrap(), *self.is_llm_enabled.lock().unwrap(), *self.is_pinned.lock().unwrap(), &config);
-                self._tray_icon.set_menu(Some(Box::new(menu_state.menu.clone())));
+
+                let menu_state = build_tray_menu(
+                    *self.is_capture_enabled.lock().unwrap(),
+                    *self.is_llm_enabled.lock().unwrap(),
+                    *self.is_pinned.lock().unwrap(),
+                    &config,
+                );
+                self._tray_icon
+                    .set_menu(Some(Box::new(menu_state.menu.clone())));
                 self._tray_menu_state = menu_state;
             }
         }
@@ -209,7 +295,11 @@ impl eframe::App for HoverDictApp {
 
         if is_window_visible && !self.last_visible {
             let pinned = *self.is_pinned.lock().unwrap();
-            let window_level = if pinned { egui::WindowLevel::AlwaysOnTop } else { egui::WindowLevel::Normal };
+            let window_level = if pinned {
+                egui::WindowLevel::AlwaysOnTop
+            } else {
+                egui::WindowLevel::Normal
+            };
             ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(window_level));
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
 
@@ -251,9 +341,29 @@ impl eframe::App for HoverDictApp {
                     });
 
                     if let Some(res) = &current_result {
-                        if res.is_llm {
+                        if res.is_error {
                             ui.heading(
-                                egui::RichText::new("大模型翻译").color(egui::Color32::from_rgb(0, 100, 200)),
+                                egui::RichText::new("大模型翻译失败")
+                                    .color(egui::Color32::from_rgb(180, 40, 40)),
+                            );
+                            ui.separator();
+                            ui.label(
+                                egui::RichText::new(&res.source_text)
+                                    .size(13.0)
+                                    .color(egui::Color32::from_rgb(90, 90, 90)),
+                            );
+                            ui.add_space(6.0);
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new(&res.translation)
+                                        .size(14.0)
+                                        .color(egui::Color32::from_rgb(40, 40, 40)),
+                                );
+                            });
+                        } else if res.is_llm {
+                            ui.heading(
+                                egui::RichText::new("大模型翻译")
+                                    .color(egui::Color32::from_rgb(0, 100, 200)),
                             );
                             ui.separator();
                             egui::ScrollArea::vertical().show(ui, |ui| {
@@ -285,7 +395,7 @@ impl eframe::App for HoverDictApp {
         }
 
         self.last_visible = is_window_visible;
-        
+
         // Ensure continuous polling for menu events
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
@@ -302,22 +412,34 @@ struct TrayMenuState {
     _quit_item: MenuItem,
 }
 
-fn build_tray_menu(is_capture_enabled: bool, is_llm_enabled: bool, is_pinned: bool, config: &ModelsConfig) -> TrayMenuState {
+fn build_tray_menu(
+    is_capture_enabled: bool,
+    is_llm_enabled: bool,
+    is_pinned: bool,
+    config: &ModelsConfig,
+) -> TrayMenuState {
     let tray_menu = Menu::new();
-    let toggle_capture = CheckMenuItem::with_id("toggle_capture", "开启划词翻译", true, is_capture_enabled, None);
-    let toggle_llm = CheckMenuItem::with_id("toggle_llm", "开启大模型翻译", true, is_llm_enabled, None);
+    let toggle_capture = CheckMenuItem::with_id(
+        "toggle_capture",
+        "开启划词翻译",
+        true,
+        is_capture_enabled,
+        None,
+    );
+    let toggle_llm =
+        CheckMenuItem::with_id("toggle_llm", "开启大模型翻译", true, is_llm_enabled, None);
     let toggle_pin = CheckMenuItem::with_id("toggle_pin", "翻译窗口置顶", true, is_pinned, None);
-    
+
     let mut model_items = Vec::new();
     let model_menu = Submenu::new("选择模型", true);
     for model in &config.models {
         let is_active = model.id == config.active_model;
         let prefix = if is_active { "√ " } else { "  " };
         let item = MenuItem::with_id(
-            format!("model_{}", model.id), 
-            format!("{}{}", prefix, model.name), 
-            true, 
-            None
+            format!("model_{}", model.id),
+            format!("{}{}", prefix, model.name),
+            true,
+            None,
         );
         let _ = model_menu.append(&item);
         model_items.push(item);
@@ -325,16 +447,16 @@ fn build_tray_menu(is_capture_enabled: bool, is_llm_enabled: bool, is_pinned: bo
 
     let quit_item = MenuItem::with_id("quit", "彻底退出", true, None);
     let separator = PredefinedMenuItem::separator();
-    
+
     let _ = tray_menu.append_items(&[
-        &toggle_capture, 
-        &toggle_llm, 
+        &toggle_capture,
+        &toggle_llm,
         &toggle_pin,
-        &model_menu, 
-        &separator, 
-        &quit_item
+        &model_menu,
+        &separator,
+        &quit_item,
     ]);
-    
+
     TrayMenuState {
         menu: tray_menu,
         _toggle_capture: toggle_capture,
@@ -392,7 +514,7 @@ fn main() -> eframe::Result<()> {
 
             let state_clone = Arc::clone(&shared_state);
             let is_llm_for_thread = Arc::clone(&is_llm_enabled);
-            
+
             thread::spawn(move || {
                 let dict = LocalSqliteDict::new("dict.db");
 
@@ -400,13 +522,15 @@ fn main() -> eframe::Result<()> {
                     if let Some(text) = capture_selected_text() {
                         let config = ModelsConfig::load();
                         let llm_enabled = *is_llm_for_thread.lock().unwrap();
-                        
+
                         let word_count = text.split_whitespace().count();
-                        let has_punct = text.chars().any(|c| c.is_ascii_punctuation() || "，。！？；：".contains(c));
+                        let has_punct = text
+                            .chars()
+                            .any(|c| c.is_ascii_punctuation() || "，。！？；：".contains(c));
                         let is_sentence = word_count >= 3 || has_punct;
-                        
+
                         let mut final_res = None;
-                        
+
                         if !is_sentence {
                             // 短文本：先查本地词典
                             if let Ok(Some(res)) = dict.translate(&text) {
@@ -415,8 +539,16 @@ fn main() -> eframe::Result<()> {
                                 // 本地查词失败，且大模型已开启，则走大模型重试
                                 match LlmTranslator::translate(&text, &config) {
                                     Ok(Some(res)) => final_res = Some(res),
-                                    Err(e) => show_notify("大模型重试失败", &e.to_string()),
-                                    _ => {}
+                                    Ok(None) => {
+                                        final_res = Some(TranslateResult::error(
+                                            &text,
+                                            "大模型没有返回翻译结果",
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        final_res =
+                                            Some(TranslateResult::error(&text, e.to_string()));
+                                    }
                                 }
                             }
                         } else {
@@ -424,14 +556,25 @@ fn main() -> eframe::Result<()> {
                             if llm_enabled {
                                 match LlmTranslator::translate(&text, &config) {
                                     Ok(Some(res)) => final_res = Some(res),
-                                    Err(e) => {
-                                        show_notify("大模型查询失败", &e.to_string());
-                                        // 失败后回退查本地词典
+                                    Ok(None) => {
                                         if let Ok(Some(res)) = dict.translate(&text) {
                                             final_res = Some(res);
+                                        } else {
+                                            final_res = Some(TranslateResult::error(
+                                                &text,
+                                                "大模型没有返回翻译结果",
+                                            ));
                                         }
                                     }
-                                    _ => {}
+                                    Err(e) => {
+                                        let error_message = e.to_string();
+                                        if let Ok(Some(res)) = dict.translate(&text) {
+                                            final_res = Some(res);
+                                        } else {
+                                            final_res =
+                                                Some(TranslateResult::error(&text, error_message));
+                                        }
+                                    }
                                 }
                             } else {
                                 // 大模型未开启，强行查本地词典
@@ -440,15 +583,12 @@ fn main() -> eframe::Result<()> {
                                 }
                             }
                         }
-                        
+
                         if let Some(res) = final_res {
-                            let mut st = state_clone.lock().unwrap();
-                            st.current_result = Some(res);
-                            st.is_window_visible = true;
-                            st.pending_pos = Some((up_x + 12, up_y + 12));
-                            st.shown_at = Some(Instant::now());
-                            drop(st);
-                            ctx_clone.request_repaint();
+                            if res.is_error {
+                                show_notify("大模型翻译失败", &res.translation);
+                            }
+                            show_result_window(&state_clone, &ctx_clone, res, up_x, up_y);
                         } else {
                             show_notify("查询结果", "翻译失败或词库中没有这个词");
                         }

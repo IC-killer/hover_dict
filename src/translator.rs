@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::error::Error;
 use std::fs;
+use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct TranslateResult {
@@ -10,6 +11,19 @@ pub struct TranslateResult {
     pub phonetic: Option<String>,
     pub translation: String,
     pub is_llm: bool,
+    pub is_error: bool,
+}
+
+impl TranslateResult {
+    pub fn error(source_text: &str, message: impl Into<String>) -> Self {
+        Self {
+            source_text: source_text.to_string(),
+            phonetic: None,
+            translation: message.into(),
+            is_llm: true,
+            is_error: true,
+        }
+    }
 }
 
 pub struct LocalSqliteDict {
@@ -31,7 +45,8 @@ impl LocalSqliteDict {
         let word = text.trim().to_lowercase();
 
         let query = "SELECT phonetic, translation, exchange FROM dictionary WHERE word = ? LIMIT 1";
-        let query_fallback = "SELECT phonetic, translation, exchange FROM stardict WHERE word = ? LIMIT 1";
+        let query_fallback =
+            "SELECT phonetic, translation, exchange FROM stardict WHERE word = ? LIMIT 1";
 
         let mut stmt = conn
             .prepare(query)
@@ -47,11 +62,19 @@ impl LocalSqliteDict {
                 if let Some(exch) = exchange {
                     for part in exch.split('/') {
                         if let Some(lemma) = part.strip_prefix("0:") {
-                            if let Ok(mut lemma_stmt) = conn.prepare("SELECT phonetic FROM stardict WHERE word = ? LIMIT 1") {
+                            if let Ok(mut lemma_stmt) =
+                                conn.prepare("SELECT phonetic FROM stardict WHERE word = ? LIMIT 1")
+                            {
                                 if let Ok(mut lemma_rows) = lemma_stmt.query([lemma]) {
                                     if let Ok(Some(lemma_row)) = lemma_rows.next() {
-                                        let lemma_phonetic: Option<String> = lemma_row.get(0).unwrap_or(None);
-                                        if !lemma_phonetic.as_deref().unwrap_or("").trim().is_empty() {
+                                        let lemma_phonetic: Option<String> =
+                                            lemma_row.get(0).unwrap_or(None);
+                                        if !lemma_phonetic
+                                            .as_deref()
+                                            .unwrap_or("")
+                                            .trim()
+                                            .is_empty()
+                                        {
                                             phonetic = lemma_phonetic;
                                         }
                                     }
@@ -68,6 +91,7 @@ impl LocalSqliteDict {
                 phonetic: phonetic.filter(|s| !s.is_empty()),
                 translation: translation.replace("\\n", "\n").replace("\\r", ""),
                 is_llm: false,
+                is_error: false,
             }))
         } else {
             Ok(None)
@@ -96,11 +120,17 @@ impl ModelsConfig {
             api_endpoint: "https://api.siliconflow.cn/v1/chat/completions".to_string(),
             api_key_env_var: "SILICONFLOW_API_KEY".to_string(),
             models: vec![
-                ModelItem { id: "tencent/Hunyuan-MT-7B".to_string(), name: "混元 7B (SiliconFlow)".to_string() },
-                ModelItem { id: "Qwen/Qwen2.5-7B-Instruct".to_string(), name: "通义千问 2.5 (SiliconFlow)".to_string() },
+                ModelItem {
+                    id: "tencent/Hunyuan-MT-7B".to_string(),
+                    name: "混元 7B (SiliconFlow)".to_string(),
+                },
+                ModelItem {
+                    id: "Qwen/Qwen2.5-7B-Instruct".to_string(),
+                    name: "通义千问 2.5 (SiliconFlow)".to_string(),
+                },
             ],
         };
-        
+
         match fs::read_to_string("models.json") {
             Ok(content) => serde_json::from_str(&content).unwrap_or_else(|_| {
                 default_config.save();
@@ -123,14 +153,23 @@ impl ModelsConfig {
 pub struct LlmTranslator;
 
 impl LlmTranslator {
-    pub fn translate(text: &str, config: &ModelsConfig) -> Result<Option<TranslateResult>, Box<dyn Error + Send + Sync>> {
+    pub fn translate(
+        text: &str,
+        config: &ModelsConfig,
+    ) -> Result<Option<TranslateResult>, Box<dyn Error + Send + Sync>> {
         let api_key = std::env::var(&config.api_key_env_var).unwrap_or_default();
         if api_key.is_empty() {
-            return Err("API key is missing. Please set environment variable.".into());
+            return Err(format!(
+                "API key is missing. Please set environment variable {}.",
+                config.api_key_env_var
+            )
+            .into());
         }
 
-        let client = reqwest::blocking::Client::new();
-        
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()?;
+
         let payload = json!({
             "model": config.active_model,
             "messages": [
@@ -145,7 +184,8 @@ impl LlmTranslator {
             ]
         });
 
-        let res = client.post(&config.api_endpoint)
+        let res = client
+            .post(&config.api_endpoint)
             .header("Authorization", format!("Bearer {}", api_key))
             .json(&payload)
             .send()?;
@@ -157,13 +197,14 @@ impl LlmTranslator {
         }
 
         let res_json: serde_json::Value = res.json()?;
-        
+
         if let Some(content) = res_json["choices"][0]["message"]["content"].as_str() {
             Ok(Some(TranslateResult {
                 source_text: text.to_string(),
                 phonetic: None,
                 translation: content.trim().to_string(),
                 is_llm: true,
+                is_error: false,
             }))
         } else {
             Err("Failed to parse LLM response.".into())
