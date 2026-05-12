@@ -53,9 +53,115 @@ fn hide_window_from_taskbar(frame: &eframe::Frame) {
 
 static MOUSE_X: AtomicI32 = AtomicI32::new(0);
 static MOUSE_Y: AtomicI32 = AtomicI32::new(0);
+const POPUP_GAP_PX: i32 = 14;
+const SCREEN_MARGIN_PX: i32 = 12;
 
 pub fn show_notify(title: &str, body: &str) {
     let _ = Notification::new().summary(title).body(body).show();
+}
+
+#[derive(Clone, Copy)]
+struct WorkArea {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+}
+
+impl WorkArea {
+    fn width(self) -> i32 {
+        self.right - self.left
+    }
+
+    fn height(self) -> i32 {
+        self.bottom - self.top
+    }
+}
+
+#[cfg(windows)]
+fn work_area_for_point(x: i32, y: i32) -> Option<WorkArea> {
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
+
+    let monitor = unsafe { MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST) };
+    if monitor == 0 {
+        return None;
+    }
+
+    let mut info: MONITORINFO = unsafe { std::mem::zeroed() };
+    info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+
+    if unsafe { GetMonitorInfoW(monitor, &mut info) } == 0 {
+        return None;
+    }
+
+    Some(WorkArea {
+        left: info.rcWork.left,
+        top: info.rcWork.top,
+        right: info.rcWork.right,
+        bottom: info.rcWork.bottom,
+    })
+}
+
+#[cfg(not(windows))]
+fn work_area_for_point(_x: i32, _y: i32) -> Option<WorkArea> {
+    None
+}
+
+fn popup_size_for_result(result: Option<&TranslateResult>) -> egui::Vec2 {
+    match result {
+        Some(res) if res.is_error => egui::vec2(460.0, 300.0),
+        Some(res) if res.is_llm => egui::vec2(460.0, 340.0),
+        Some(_) => egui::vec2(360.0, 240.0),
+        None => egui::vec2(320.0, 220.0),
+    }
+}
+
+fn adjusted_popup_layout(
+    anchor_x: i32,
+    anchor_y: i32,
+    desired_size: egui::Vec2,
+    pixels_per_point: f32,
+) -> (egui::Vec2, egui::Pos2) {
+    let ppp = pixels_per_point.max(0.1);
+    let mut width_px = (desired_size.x * ppp).round() as i32;
+    let mut height_px = (desired_size.y * ppp).round() as i32;
+
+    if let Some(work_area) = work_area_for_point(anchor_x, anchor_y) {
+        width_px = width_px.min((work_area.width() - SCREEN_MARGIN_PX * 2).max(240));
+        height_px = height_px.min((work_area.height() - SCREEN_MARGIN_PX * 2).max(160));
+
+        let min_x = work_area.left + SCREEN_MARGIN_PX;
+        let max_x = work_area.right - width_px - SCREEN_MARGIN_PX;
+        let min_y = work_area.top + SCREEN_MARGIN_PX;
+        let max_y = work_area.bottom - height_px - SCREEN_MARGIN_PX;
+
+        let mut x = anchor_x + POPUP_GAP_PX;
+        if x > max_x {
+            x = anchor_x - width_px - POPUP_GAP_PX;
+        }
+        let mut y = anchor_y + POPUP_GAP_PX;
+        if y > max_y {
+            y = anchor_y - height_px - POPUP_GAP_PX;
+        }
+
+        let x = x.clamp(min_x, max_x.max(min_x));
+        let y = y.clamp(min_y, max_y.max(min_y));
+        (
+            egui::vec2(width_px as f32 / ppp, height_px as f32 / ppp),
+            egui::pos2(x as f32 / ppp, y as f32 / ppp),
+        )
+    } else {
+        (
+            desired_size,
+            egui::pos2(
+                (anchor_x + POPUP_GAP_PX) as f32 / ppp,
+                (anchor_y + POPUP_GAP_PX) as f32 / ppp,
+            ),
+        )
+    }
 }
 
 fn show_result_window(
@@ -68,10 +174,137 @@ fn show_result_window(
     let mut st = state.lock().unwrap();
     st.current_result = Some(result);
     st.is_window_visible = true;
-    st.pending_pos = Some((x + 12, y + 12));
+    st.pending_pos = Some((x, y));
     st.shown_at = Some(Instant::now());
     drop(st);
     ctx.request_repaint();
+}
+
+fn result_theme(result: &TranslateResult) -> (&'static str, &'static str, egui::Color32) {
+    if result.is_error {
+        (
+            "大模型翻译失败",
+            "请求未完成",
+            egui::Color32::from_rgb(196, 61, 58),
+        )
+    } else if result.is_llm {
+        (
+            "大模型翻译",
+            "智能翻译",
+            egui::Color32::from_rgb(40, 112, 198),
+        )
+    } else {
+        (
+            "本地词典",
+            "离线词库",
+            egui::Color32::from_rgb(43, 132, 101),
+        )
+    }
+}
+
+fn preview_text(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    let mut preview: String = trimmed.chars().take(max_chars).collect();
+    if trimmed.chars().count() > max_chars {
+        preview.push_str("...");
+    }
+    preview
+}
+
+fn render_popup_result(
+    ui: &mut egui::Ui,
+    shared_state: &Arc<Mutex<SharedState>>,
+    result: &TranslateResult,
+) {
+    let (title, subtitle, accent) = result_theme(result);
+    let muted = egui::Color32::from_rgb(96, 102, 112);
+    let text = egui::Color32::from_rgb(30, 34, 40);
+    let subtle_fill = accent.linear_multiply(0.08);
+
+    egui::Frame::none()
+        .fill(subtle_fill)
+        .inner_margin(egui::Margin::symmetric(14.0, 10.0))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(egui::RichText::new(title).size(15.5).strong().color(text));
+                    ui.label(
+                        egui::RichText::new(subtitle)
+                            .size(11.5)
+                            .color(accent.linear_multiply(0.85)),
+                    );
+                });
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let close = egui::Button::new(
+                        egui::RichText::new("×").size(18.0).strong().color(muted),
+                    )
+                    .frame(false)
+                    .min_size(egui::vec2(28.0, 28.0));
+                    if ui.add(close).clicked() {
+                        if let Ok(mut st) = shared_state.lock() {
+                            st.is_window_visible = false;
+                        }
+                    }
+                });
+            });
+        });
+
+    egui::Frame::none()
+        .inner_margin(egui::Margin::symmetric(14.0, 12.0))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+
+            if !result.is_llm && !result.is_error {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(&result.source_text)
+                            .size(20.0)
+                            .strong()
+                            .color(text),
+                    )
+                    .wrap(true),
+                );
+                if let Some(phonetic) = &result.phonetic {
+                    ui.label(
+                        egui::RichText::new(format!("[{}]", phonetic))
+                            .size(13.0)
+                            .color(muted),
+                    );
+                }
+            } else {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(preview_text(&result.source_text, 120))
+                            .size(12.5)
+                            .color(muted),
+                    )
+                    .wrap(true),
+                );
+            }
+
+            ui.separator();
+
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    let body_color = if result.is_error {
+                        egui::Color32::from_rgb(112, 38, 38)
+                    } else {
+                        text
+                    };
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(&result.translation)
+                                .size(if result.is_llm { 15.0 } else { 14.0 })
+                                .color(body_color),
+                        )
+                        .wrap(true),
+                    );
+                });
+        });
 }
 
 fn get_cat_icon() -> Icon {
@@ -293,28 +526,25 @@ impl eframe::App for HoverDictApp {
             )
         };
 
-        if is_window_visible && !self.last_visible {
-            let pinned = *self.is_pinned.lock().unwrap();
-            let window_level = if pinned {
-                egui::WindowLevel::AlwaysOnTop
-            } else {
-                egui::WindowLevel::Normal
-            };
-            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(window_level));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        if is_window_visible {
+            if !self.last_visible {
+                let pinned = *self.is_pinned.lock().unwrap();
+                let window_level = if pinned {
+                    egui::WindowLevel::AlwaysOnTop
+                } else {
+                    egui::WindowLevel::Normal
+                };
+                ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(window_level));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
 
             if let Some((px, py)) = pending_pos {
-                let ppp = ctx.pixels_per_point();
-                let x = px as f32 / ppp;
-                let y = py as f32 / ppp;
-                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(x, y)));
+                let desired_size = popup_size_for_result(current_result.as_ref());
+                let (size, position) =
+                    adjusted_popup_layout(px, py, desired_size, ctx.pixels_per_point());
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(position));
             }
-            let size = if current_result.as_ref().map(|r| r.is_llm).unwrap_or(false) {
-                egui::vec2(400.0, 300.0)
-            } else {
-                egui::vec2(300.0, 200.0)
-            };
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
         }
 
         if !is_window_visible && self.last_visible {
@@ -327,70 +557,30 @@ impl eframe::App for HoverDictApp {
         if is_window_visible {
             egui::CentralPanel::default()
                 .frame(
-                    egui::Frame::window(&ctx.style())
-                        .fill(egui::Color32::from_rgb(250, 250, 250))
-                        .rounding(8.0),
+                    egui::Frame::none()
+                        .fill(egui::Color32::TRANSPARENT)
+                        .inner_margin(egui::Margin::same(10.0)),
                 )
                 .show(ctx, |ui| {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                        if ui.button("×").clicked() {
-                            if let Ok(mut st) = self.shared_state.lock() {
-                                st.is_window_visible = false;
+                    let card_size = ui.available_size();
+                    egui::Frame::none()
+                        .fill(egui::Color32::from_rgb(255, 255, 255))
+                        .stroke(egui::Stroke::new(
+                            1.0,
+                            egui::Color32::from_rgb(218, 224, 232),
+                        ))
+                        .rounding(8.0)
+                        .shadow(egui::epaint::Shadow {
+                            extrusion: 18.0,
+                            color: egui::Color32::from_black_alpha(42),
+                        })
+                        .inner_margin(egui::Margin::same(0.0))
+                        .show(ui, |ui| {
+                            ui.set_min_size(card_size);
+                            if let Some(res) = &current_result {
+                                render_popup_result(ui, &self.shared_state, res);
                             }
-                        }
-                    });
-
-                    if let Some(res) = &current_result {
-                        if res.is_error {
-                            ui.heading(
-                                egui::RichText::new("大模型翻译失败")
-                                    .color(egui::Color32::from_rgb(180, 40, 40)),
-                            );
-                            ui.separator();
-                            ui.label(
-                                egui::RichText::new(&res.source_text)
-                                    .size(13.0)
-                                    .color(egui::Color32::from_rgb(90, 90, 90)),
-                            );
-                            ui.add_space(6.0);
-                            egui::ScrollArea::vertical().show(ui, |ui| {
-                                ui.label(
-                                    egui::RichText::new(&res.translation)
-                                        .size(14.0)
-                                        .color(egui::Color32::from_rgb(40, 40, 40)),
-                                );
-                            });
-                        } else if res.is_llm {
-                            ui.heading(
-                                egui::RichText::new("大模型翻译")
-                                    .color(egui::Color32::from_rgb(0, 100, 200)),
-                            );
-                            ui.separator();
-                            egui::ScrollArea::vertical().show(ui, |ui| {
-                                ui.label(
-                                    egui::RichText::new(&res.translation)
-                                        .size(15.0)
-                                        .color(egui::Color32::from_rgb(40, 40, 40)),
-                                );
-                            });
-                        } else {
-                            ui.heading(
-                                egui::RichText::new(&res.source_text).color(egui::Color32::BLACK),
-                            );
-                            if let Some(phonetic) = &res.phonetic {
-                                ui.label(
-                                    egui::RichText::new(format!("[{}]", phonetic))
-                                        .color(egui::Color32::GRAY),
-                                );
-                            }
-                            ui.separator();
-                            ui.label(
-                                egui::RichText::new(&res.translation)
-                                    .size(14.0)
-                                    .color(egui::Color32::from_rgb(40, 40, 40)),
-                            );
-                        }
-                    }
+                        });
                 });
         }
 
