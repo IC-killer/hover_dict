@@ -706,83 +706,130 @@ fn main() -> eframe::Result<()> {
             let is_llm_for_thread = Arc::clone(&is_llm_enabled);
 
             thread::spawn(move || {
-                let dict = LocalSqliteDict::new("dict.db");
+                let dict = Arc::new(LocalSqliteDict::new("dict.db"));
 
                 while let Ok((up_x, up_y)) = capture_rx.recv() {
-                    if let Some(text) = capture_selected_text() {
-                        let config = ModelsConfig::load();
-                        let llm_enabled = *is_llm_for_thread.lock().unwrap();
+                    // 每次划词都 spawn 独立线程处理，避免阻塞后续划词
+                    let state = Arc::clone(&state_clone);
+                    let ctx = ctx_clone.clone();
+                    let is_llm = Arc::clone(&is_llm_for_thread);
+                    let dict = Arc::clone(&dict);
 
-                        let word_count = text.split_whitespace().count();
-                        let has_punct = text
-                            .chars()
-                            .any(|c| c.is_ascii_punctuation() || "，。！？；：".contains(c));
-                        let is_sentence = word_count >= 3 || has_punct;
+                    thread::spawn(move || {
+                        match capture_selected_text() {
+                            Some(text) => {
+                                let config = ModelsConfig::load();
+                                let llm_enabled = *is_llm.lock().unwrap();
 
-                        let mut final_res = None;
+                                let word_count = text.split_whitespace().count();
+                                let has_punct = text
+                                    .chars()
+                                    .any(|c| c.is_ascii_punctuation() || "，。！？；：".contains(c));
+                                let is_sentence = word_count >= 3 || has_punct;
 
-                        if !is_sentence {
-                            // 短文本：先查本地词典
-                            if let Ok(Some(res)) = dict.translate(&text) {
-                                final_res = Some(res);
-                            } else if llm_enabled {
-                                // 本地查词失败，且大模型已开启，则走大模型重试
-                                match LlmTranslator::translate(&text, &config) {
-                                    Ok(Some(res)) => final_res = Some(res),
-                                    Ok(None) => {
-                                        final_res = Some(TranslateResult::error(
-                                            &text,
-                                            "大模型没有返回翻译结果",
-                                        ));
-                                    }
-                                    Err(e) => {
-                                        final_res =
-                                            Some(TranslateResult::error(&text, e.to_string()));
-                                    }
-                                }
-                            }
-                        } else {
-                            // 长文本（句子/段落）：优先走大模型
-                            if llm_enabled {
-                                match LlmTranslator::translate(&text, &config) {
-                                    Ok(Some(res)) => final_res = Some(res),
-                                    Ok(None) => {
-                                        if let Ok(Some(res)) = dict.translate(&text) {
-                                            final_res = Some(res);
-                                        } else {
-                                            final_res = Some(TranslateResult::error(
-                                                &text,
-                                                "大模型没有返回翻译结果",
-                                            ));
+                                let mut final_res = None;
+
+                                if !is_sentence {
+                                    // 短文本：先查本地词典
+                                    if let Ok(Some(res)) = dict.translate(&text) {
+                                        final_res = Some(res);
+                                    } else if llm_enabled {
+                                        // 本地查词失败，且大模型已开启，则走大模型重试
+                                        show_result_window(
+                                            &state,
+                                            &ctx,
+                                            TranslateResult {
+                                                source_text: text.clone(),
+                                                phonetic: None,
+                                                translation: "大模型翻译中…".to_string(),
+                                                is_llm: true,
+                                                is_error: false,
+                                            },
+                                            up_x,
+                                            up_y,
+                                        );
+
+                                        match LlmTranslator::translate(&text, &config) {
+                                            Ok(Some(res)) => final_res = Some(res),
+                                            Ok(None) => {
+                                                final_res = Some(TranslateResult::error(
+                                                    &text,
+                                                    "大模型没有返回翻译结果",
+                                                ));
+                                            }
+                                            Err(e) => {
+                                                final_res = Some(TranslateResult::error(
+                                                    &text,
+                                                    e.to_string(),
+                                                ));
+                                            }
                                         }
                                     }
-                                    Err(e) => {
-                                        let error_message = e.to_string();
+                                } else {
+                                    // 长文本（句子/段落）：优先走大模型
+                                    if llm_enabled {
+                                        // 立即显示"翻译中"加载窗口
+                                        show_result_window(
+                                            &state,
+                                            &ctx,
+                                            TranslateResult {
+                                                source_text: text.clone(),
+                                                phonetic: None,
+                                                translation: "大模型翻译中…".to_string(),
+                                                is_llm: true,
+                                                is_error: false,
+                                            },
+                                            up_x,
+                                            up_y,
+                                        );
+
+                                        match LlmTranslator::translate(&text, &config) {
+                                            Ok(Some(res)) => final_res = Some(res),
+                                            Ok(None) => {
+                                                if let Ok(Some(res)) = dict.translate(&text) {
+                                                    final_res = Some(res);
+                                                } else {
+                                                    final_res = Some(TranslateResult::error(
+                                                        &text,
+                                                        "大模型没有返回翻译结果",
+                                                    ));
+                                                }
+                                            }
+                                            Err(e) => {
+                                                let error_message = e.to_string();
+                                                if let Ok(Some(res)) = dict.translate(&text) {
+                                                    final_res = Some(res);
+                                                } else {
+                                                    final_res = Some(TranslateResult::error(
+                                                        &text,
+                                                        error_message,
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        // 大模型未开启，强行查本地词典
                                         if let Ok(Some(res)) = dict.translate(&text) {
                                             final_res = Some(res);
-                                        } else {
-                                            final_res =
-                                                Some(TranslateResult::error(&text, error_message));
                                         }
                                     }
                                 }
-                            } else {
-                                // 大模型未开启，强行查本地词典
-                                if let Ok(Some(res)) = dict.translate(&text) {
-                                    final_res = Some(res);
+
+                                if let Some(res) = final_res {
+                                    if res.is_error {
+                                        show_notify("大模型翻译失败", &res.translation);
+                                    }
+                                    show_result_window(&state, &ctx, res, up_x, up_y);
+                                } else {
+                                    show_notify("查询结果", "翻译失败或词库中没有这个词");
                                 }
                             }
-                        }
-
-                        if let Some(res) = final_res {
-                            if res.is_error {
-                                show_notify("大模型翻译失败", &res.translation);
+                            None => {
+                                // 剪贴板捕获失败，给用户明确反馈
+                                show_notify("划词翻译", "未能获取选中文本，请重试");
                             }
-                            show_result_window(&state_clone, &ctx_clone, res, up_x, up_y);
-                        } else {
-                            show_notify("查询结果", "翻译失败或词库中没有这个词");
                         }
-                    }
+                    });
                 }
             });
 
