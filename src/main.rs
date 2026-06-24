@@ -211,6 +211,229 @@ fn preview_text(text: &str, max_chars: usize) -> String {
     preview
 }
 
+fn render_input_window(
+    ui: &mut egui::Ui,
+    shared_state: &Arc<Mutex<SharedState>>,
+    ctx: &egui::Context,
+    is_llm_enabled: &Arc<Mutex<bool>>,
+) {
+    let muted = egui::Color32::from_rgb(96, 102, 112);
+    let text_color = egui::Color32::from_rgb(30, 34, 40);
+    let accent = egui::Color32::from_rgb(40, 112, 198);
+
+    // 标题栏
+    egui::Frame::none()
+        .fill(accent.linear_multiply(0.08))
+        .inner_margin(egui::Margin::symmetric(14.0, 10.0))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("中译英").size(15.5).strong().color(text_color));
+                ui.label(
+                    egui::RichText::new("手动输入翻译")
+                        .size(11.5)
+                        .color(accent.linear_multiply(0.85)),
+                );
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let close = egui::Button::new(
+                        egui::RichText::new("×").size(18.0).strong().color(muted),
+                    )
+                    .frame(false)
+                    .min_size(egui::vec2(28.0, 28.0));
+                    if ui.add(close).clicked() {
+                        if let Ok(mut st) = shared_state.lock() {
+                            st.is_input_window_visible = false;
+                            st.input_text.clear();
+                        }
+                    }
+                });
+            });
+        });
+
+    // 内容区域
+    let mut should_translate = false;
+    let mut text_to_translate = String::new();
+
+    egui::Frame::none()
+        .inner_margin(egui::Margin::symmetric(14.0, 12.0))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+
+            // 输入框
+            ui.label(
+                egui::RichText::new("输入文本")
+                    .size(12.0)
+                    .strong()
+                    .color(muted),
+            );
+
+            let (mut input_text, input_translating) = {
+                let st = shared_state.lock().unwrap();
+                (st.input_text.clone(), st.input_translating)
+            };
+
+            let text_edit_response = ui.add(
+                egui::TextEdit::multiline(&mut input_text)
+                    .hint_text("输入中文或英文，自动识别并翻译…")
+                    .desired_width(f32::INFINITY)
+                    .desired_rows(3)
+                    .interactive(!input_translating),
+            );
+
+            // 写回输入文本（TextEdit 会直接修改 input_text）
+            {
+                let mut st = shared_state.lock().unwrap();
+                st.input_text = input_text.clone();
+            }
+
+            // 支持 Enter 键触发翻译
+            let enter_pressed = text_edit_response.lost_focus()
+                && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let btn_clicked = ui
+                .add_enabled(
+                    !input_translating && !input_text.trim().is_empty(),
+                    egui::Button::new(
+                        egui::RichText::new(if input_translating {
+                            "翻译中…"
+                        } else {
+                            "翻译"
+                        })
+                        .size(14.0),
+                    )
+                    .min_size(egui::vec2(ui.available_width(), 36.0)),
+                )
+                .clicked();
+
+            if enter_pressed || btn_clicked {
+                should_translate = true;
+                text_to_translate = input_text.trim().to_string();
+            }
+
+            ui.add_space(4.0);
+
+            // 结果区域
+            let input_result = {
+                let st = shared_state.lock().unwrap();
+                st.input_result.clone()
+            };
+
+            if let Some(ref res) = input_result {
+                ui.separator();
+                render_popup_result(ui, shared_state, res);
+            }
+        });
+
+    // 点击翻译按钮后，spawn 线程执行翻译
+    if should_translate {
+        let state = Arc::clone(shared_state);
+        let ctx = ctx.clone();
+        let is_llm = Arc::clone(is_llm_enabled);
+
+        // 先设置翻译中状态
+        {
+            let mut st = state.lock().unwrap();
+            st.input_translating = true;
+            st.input_result = Some(TranslateResult {
+                source_text: text_to_translate.clone(),
+                phonetic: None,
+                translation: "翻译中…".to_string(),
+                is_llm: true,
+                is_error: false,
+            });
+        }
+        ctx.request_repaint();
+
+        thread::spawn(move || {
+            let config = ModelsConfig::load();
+            let llm_enabled = *is_llm.lock().unwrap();
+
+            let word_count = text_to_translate.split_whitespace().count();
+            let has_punct = text_to_translate
+                .chars()
+                .any(|c| c.is_ascii_punctuation() || "，。！？；：".contains(c));
+            let is_sentence = word_count >= 3 || has_punct;
+
+            let mut final_res = None;
+
+            if !is_sentence {
+                // 短文本：先查本地词典
+                let dict = LocalSqliteDict::new("dict.db");
+                if let Ok(Some(res)) = dict.translate(&text_to_translate) {
+                    final_res = Some(res);
+                } else if llm_enabled {
+                    match LlmTranslator::translate(&text_to_translate, &config) {
+                        Ok(Some(res)) => final_res = Some(res),
+                        Ok(None) => {
+                            final_res = Some(TranslateResult::error(
+                                &text_to_translate,
+                                "大模型没有返回翻译结果",
+                            ));
+                        }
+                        Err(e) => {
+                            final_res =
+                                Some(TranslateResult::error(&text_to_translate, e.to_string()));
+                        }
+                    }
+                }
+            } else {
+                // 长文本（句子/段落）：优先走大模型
+                if llm_enabled {
+                    match LlmTranslator::translate(&text_to_translate, &config) {
+                        Ok(Some(res)) => final_res = Some(res),
+                        Ok(None) => {
+                            let dict = LocalSqliteDict::new("dict.db");
+                            if let Ok(Some(res)) = dict.translate(&text_to_translate) {
+                                final_res = Some(res);
+                            } else {
+                                final_res = Some(TranslateResult::error(
+                                    &text_to_translate,
+                                    "大模型没有返回翻译结果",
+                                ));
+                            }
+                        }
+                        Err(e) => {
+                            let error_message = e.to_string();
+                            let dict = LocalSqliteDict::new("dict.db");
+                            if let Ok(Some(res)) = dict.translate(&text_to_translate) {
+                                final_res = Some(res);
+                            } else {
+                                final_res =
+                                    Some(TranslateResult::error(&text_to_translate, error_message));
+                            }
+                        }
+                    }
+                } else {
+                    let dict = LocalSqliteDict::new("dict.db");
+                    if let Ok(Some(res)) = dict.translate(&text_to_translate) {
+                        final_res = Some(res);
+                    }
+                }
+            }
+
+            if let Some(res) = final_res {
+                if res.is_error {
+                    show_notify("翻译失败", &res.translation);
+                }
+                if let Ok(mut st) = state.lock() {
+                    st.input_result = Some(res);
+                    st.input_translating = false;
+                }
+            } else {
+                if let Ok(mut st) = state.lock() {
+                    st.input_result = Some(TranslateResult::error(
+                        &text_to_translate,
+                        "翻译失败或词库中没有这个词",
+                    ));
+                    st.input_translating = false;
+                }
+            }
+            ctx.request_repaint();
+        });
+    }
+}
+
 fn render_popup_result(
     ui: &mut egui::Ui,
     shared_state: &Arc<Mutex<SharedState>>,
@@ -398,6 +621,11 @@ struct SharedState {
     is_window_visible: bool,
     pending_pos: Option<(i32, i32)>,
     shown_at: Option<Instant>,
+    // 输入窗口相关
+    is_input_window_visible: bool,
+    input_text: String,
+    input_result: Option<TranslateResult>,
+    input_translating: bool,
 }
 
 struct HoverDictApp {
@@ -409,6 +637,7 @@ struct HoverDictApp {
     _tray_menu_state: TrayMenuState,
     is_first_frame: bool,
     last_visible: bool,
+    last_input_visible: bool,
 }
 
 impl eframe::App for HoverDictApp {
@@ -464,7 +693,7 @@ impl eframe::App for HoverDictApp {
                 self._tray_menu_state = menu_state;
 
                 // If the window is currently visible, update its window level immediately
-                if self.last_visible {
+                if self.last_visible || self.last_input_visible {
                     let window_level = if *pinned {
                         egui::WindowLevel::AlwaysOnTop
                     } else {
@@ -487,6 +716,18 @@ impl eframe::App for HoverDictApp {
                 self._tray_icon
                     .set_menu(Some(Box::new(menu_state.menu.clone())));
                 self._tray_menu_state = menu_state;
+            } else if id == "manual_input" {
+                let mut st = self.shared_state.lock().unwrap();
+                // 关闭划词结果窗口（互斥）
+                st.is_window_visible = false;
+                st.current_result = None;
+                // 打开输入窗口
+                st.is_input_window_visible = true;
+                st.input_text.clear();
+                st.input_result = None;
+                st.input_translating = false;
+                drop(st);
+                ctx.request_repaint();
             }
         }
 
@@ -500,22 +741,31 @@ impl eframe::App for HoverDictApp {
             )));
             self.is_first_frame = false;
             self.last_visible = false;
+            self.last_input_visible = false;
         }
 
         #[cfg(windows)]
         hide_window_from_taskbar(frame);
 
-        let mut is_window_visible = {
+        let (is_window_visible, is_input_window_visible) = {
             let state = self.shared_state.lock().unwrap();
-            state.is_window_visible
+            (state.is_window_visible, state.is_input_window_visible)
         };
 
-        if is_window_visible && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        // ESC 处理：优先关闭输入窗口，其次关闭划词结果窗口
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             if let Ok(mut st) = self.shared_state.lock() {
-                st.is_window_visible = false;
+                if st.is_input_window_visible {
+                    st.is_input_window_visible = false;
+                    st.input_text.clear();
+                } else if st.is_window_visible {
+                    st.is_window_visible = false;
+                }
             }
-            is_window_visible = false;
         }
+
+        let any_visible = is_window_visible || is_input_window_visible;
+        let was_any_visible = self.last_visible || self.last_input_visible;
 
         let (pending_pos, current_result, _shown_at) = {
             let mut state = self.shared_state.lock().unwrap();
@@ -526,8 +776,8 @@ impl eframe::App for HoverDictApp {
             )
         };
 
-        if is_window_visible {
-            if !self.last_visible {
+        if any_visible {
+            if !was_any_visible {
                 let pinned = *self.is_pinned.lock().unwrap();
                 let window_level = if pinned {
                     egui::WindowLevel::AlwaysOnTop
@@ -538,23 +788,45 @@ impl eframe::App for HoverDictApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             }
 
-            if let Some((px, py)) = pending_pos {
-                let desired_size = popup_size_for_result(current_result.as_ref());
-                let (size, position) =
-                    adjusted_popup_layout(px, py, desired_size, ctx.pixels_per_point());
-                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
-                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(position));
+            if is_input_window_visible {
+                // 输入窗口：居中在鼠标所在显示器
+                let mouse_x = MOUSE_X.load(Ordering::Relaxed);
+                let mouse_y = MOUSE_Y.load(Ordering::Relaxed);
+                let desired_size = egui::vec2(500.0, 450.0);
+                let ppp = ctx.pixels_per_point().max(0.1);
+
+                if let Some(work_area) = work_area_for_point(mouse_x, mouse_y) {
+                    let width_px = (desired_size.x * ppp).round() as i32;
+                    let height_px = (desired_size.y * ppp).round() as i32;
+                    let x = work_area.left + (work_area.width() - width_px) / 2;
+                    let y = work_area.top + (work_area.height() - height_px) / 2;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(desired_size));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+                        x as f32 / ppp,
+                        y as f32 / ppp,
+                    )));
+                } else {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(desired_size));
+                }
+            } else if is_window_visible {
+                if let Some((px, py)) = pending_pos {
+                    let desired_size = popup_size_for_result(current_result.as_ref());
+                    let (size, position) =
+                        adjusted_popup_layout(px, py, desired_size, ctx.pixels_per_point());
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(position));
+                }
             }
         }
 
-        if !is_window_visible && self.last_visible {
+        if !any_visible && was_any_visible {
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(1.0, 1.0)));
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
                 -10_000.0, -10_000.0,
             )));
         }
 
-        if is_window_visible {
+        if any_visible {
             egui::CentralPanel::default()
                 .frame(
                     egui::Frame::none()
@@ -577,7 +849,14 @@ impl eframe::App for HoverDictApp {
                         .inner_margin(egui::Margin::same(0.0))
                         .show(ui, |ui| {
                             ui.set_min_size(card_size);
-                            if let Some(res) = &current_result {
+                            if is_input_window_visible {
+                                render_input_window(
+                                    ui,
+                                    &self.shared_state,
+                                    ctx,
+                                    &self.is_llm_enabled,
+                                );
+                            } else if let Some(res) = &current_result {
                                 render_popup_result(ui, &self.shared_state, res);
                             }
                         });
@@ -585,6 +864,7 @@ impl eframe::App for HoverDictApp {
         }
 
         self.last_visible = is_window_visible;
+        self.last_input_visible = is_input_window_visible;
 
         // Ensure continuous polling for menu events
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
@@ -598,6 +878,7 @@ struct TrayMenuState {
     _toggle_pin: CheckMenuItem,
     _model_menu: Submenu,
     _model_items: Vec<MenuItem>,
+    _manual_input: MenuItem,
     _separator: PredefinedMenuItem,
     _quit_item: MenuItem,
 }
@@ -635,6 +916,7 @@ fn build_tray_menu(
         model_items.push(item);
     }
 
+    let manual_input = MenuItem::with_id("manual_input", "中译英", true, None);
     let quit_item = MenuItem::with_id("quit", "彻底退出", true, None);
     let separator = PredefinedMenuItem::separator();
 
@@ -643,6 +925,7 @@ fn build_tray_menu(
         &toggle_llm,
         &toggle_pin,
         &model_menu,
+        &manual_input,
         &separator,
         &quit_item,
     ]);
@@ -654,6 +937,7 @@ fn build_tray_menu(
         _toggle_pin: toggle_pin,
         _model_menu: model_menu,
         _model_items: model_items,
+        _manual_input: manual_input,
         _separator: separator,
         _quit_item: quit_item,
     }
@@ -673,6 +957,10 @@ fn main() -> eframe::Result<()> {
         is_window_visible: false,
         pending_pos: None,
         shown_at: None,
+        is_input_window_visible: false,
+        input_text: String::new(),
+        input_result: None,
+        input_translating: false,
     }));
 
     let config = ModelsConfig::load();
@@ -862,6 +1150,8 @@ fn main() -> eframe::Result<()> {
                     EventType::KeyPress(rdev::Key::Escape) => {
                         if let Ok(mut st) = state_for_hook.lock() {
                             st.is_window_visible = false;
+                            st.is_input_window_visible = false;
+                            st.input_text.clear();
                         }
                         ctx_for_hook.send_viewport_cmd(egui::ViewportCommand::InnerSize(
                             egui::vec2(1.0, 1.0),
@@ -885,6 +1175,7 @@ fn main() -> eframe::Result<()> {
                 _tray_menu_state: tray_menu_state,
                 is_first_frame: true,
                 last_visible: false,
+                last_input_visible: false,
             })
         }),
     )
