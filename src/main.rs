@@ -7,23 +7,23 @@ use capture::capture_selected_text;
 use crossbeam_channel::unbounded;
 use eframe::egui;
 use notify_rust::Notification;
-use rdev::{listen, Event, EventType};
+use rdev::{Event, EventType, listen};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use translator::{LlmTranslator, LocalSqliteDict, ModelsConfig, TranslateResult};
 use tray_icon::{
-    menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu},
     Icon, TrayIconBuilder,
+    menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu},
 };
 
 #[cfg(windows)]
 fn hide_window_from_taskbar(frame: &eframe::Frame) {
     use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, SWP_FRAMECHANGED,
-        SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+        GWL_EXSTYLE, GetWindowLongPtrW, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+        SetWindowLongPtrW, SetWindowPos, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
     };
 
     let Ok(handle) = frame.window_handle() else {
@@ -55,6 +55,22 @@ static MOUSE_X: AtomicI32 = AtomicI32::new(0);
 static MOUSE_Y: AtomicI32 = AtomicI32::new(0);
 const POPUP_GAP_PX: i32 = 14;
 const SCREEN_MARGIN_PX: i32 = 12;
+const DRAG_CAPTURE_DISTANCE_PX: i32 = 10;
+const DOUBLE_CLICK_MAX_INTERVAL: Duration = Duration::from_millis(500);
+const DOUBLE_CLICK_DISTANCE_PX: i32 = 10;
+const DOUBLE_CLICK_CAPTURE_DELAY: Duration = Duration::from_millis(120);
+
+#[derive(Clone, Copy)]
+enum CaptureTrigger {
+    Drag,
+    DoubleClick,
+}
+
+struct CaptureRequest {
+    x: i32,
+    y: i32,
+    trigger: CaptureTrigger,
+}
 
 pub fn show_notify(title: &str, body: &str) {
     let _ = Notification::new().summary(title).body(body).show();
@@ -82,7 +98,7 @@ impl WorkArea {
 fn work_area_for_point(x: i32, y: i32) -> Option<WorkArea> {
     use windows_sys::Win32::Foundation::POINT;
     use windows_sys::Win32::Graphics::Gdi::{
-        GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+        GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
     };
 
     let monitor = unsafe { MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST) };
@@ -228,7 +244,12 @@ fn render_input_window(
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("中译英").size(15.5).strong().color(text_color));
+                ui.label(
+                    egui::RichText::new("中译英")
+                        .size(15.5)
+                        .strong()
+                        .color(text_color),
+                );
                 ui.label(
                     egui::RichText::new("手动输入翻译")
                         .size(11.5)
@@ -289,8 +310,8 @@ fn render_input_window(
             }
 
             // 支持 Enter 键触发翻译
-            let enter_pressed = text_edit_response.lost_focus()
-                && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let enter_pressed =
+                text_edit_response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             let btn_clicked = ui
                 .add_enabled(
                     !input_translating && !input_text.trim().is_empty(),
@@ -988,7 +1009,7 @@ fn main() -> eframe::Result<()> {
             setup_custom_fonts(&cc.egui_ctx);
             let ctx_clone = cc.egui_ctx.clone();
 
-            let (capture_tx, capture_rx) = unbounded::<(i32, i32)>();
+            let (capture_tx, capture_rx) = unbounded::<CaptureRequest>();
 
             let state_clone = Arc::clone(&shared_state);
             let is_llm_for_thread = Arc::clone(&is_llm_enabled);
@@ -996,7 +1017,7 @@ fn main() -> eframe::Result<()> {
             thread::spawn(move || {
                 let dict = Arc::new(LocalSqliteDict::new("dict.db"));
 
-                while let Ok((up_x, up_y)) = capture_rx.recv() {
+                while let Ok(request) = capture_rx.recv() {
                     // 每次划词都 spawn 独立线程处理，避免阻塞后续划词
                     let state = Arc::clone(&state_clone);
                     let ctx = ctx_clone.clone();
@@ -1004,15 +1025,19 @@ fn main() -> eframe::Result<()> {
                     let dict = Arc::clone(&dict);
 
                     thread::spawn(move || {
+                        if matches!(request.trigger, CaptureTrigger::DoubleClick) {
+                            thread::sleep(DOUBLE_CLICK_CAPTURE_DELAY);
+                        }
+
                         match capture_selected_text() {
                             Some(text) => {
                                 let config = ModelsConfig::load();
                                 let llm_enabled = *is_llm.lock().unwrap();
 
                                 let word_count = text.split_whitespace().count();
-                                let has_punct = text
-                                    .chars()
-                                    .any(|c| c.is_ascii_punctuation() || "，。！？；：".contains(c));
+                                let has_punct = text.chars().any(|c| {
+                                    c.is_ascii_punctuation() || "，。！？；：".contains(c)
+                                });
                                 let is_sentence = word_count >= 3 || has_punct;
 
                                 let mut final_res = None;
@@ -1033,8 +1058,8 @@ fn main() -> eframe::Result<()> {
                                                 is_llm: true,
                                                 is_error: false,
                                             },
-                                            up_x,
-                                            up_y,
+                                            request.x,
+                                            request.y,
                                         );
 
                                         match LlmTranslator::translate(&text, &config) {
@@ -1067,8 +1092,8 @@ fn main() -> eframe::Result<()> {
                                                 is_llm: true,
                                                 is_error: false,
                                             },
-                                            up_x,
-                                            up_y,
+                                            request.x,
+                                            request.y,
                                         );
 
                                         match LlmTranslator::translate(&text, &config) {
@@ -1107,14 +1132,18 @@ fn main() -> eframe::Result<()> {
                                     if res.is_error {
                                         show_notify("大模型翻译失败", &res.translation);
                                     }
-                                    show_result_window(&state, &ctx, res, up_x, up_y);
+                                    show_result_window(&state, &ctx, res, request.x, request.y);
                                 } else {
-                                    show_notify("查询结果", "翻译失败或词库中没有这个词");
+                                    if matches!(request.trigger, CaptureTrigger::Drag) {
+                                        show_notify("查询结果", "翻译失败或词库中没有这个词");
+                                    }
                                 }
                             }
                             None => {
-                                // 剪贴板捕获失败，给用户明确反馈
-                                show_notify("划词翻译", "未能获取选中文本，请重试");
+                                if matches!(request.trigger, CaptureTrigger::Drag) {
+                                    // 剪贴板捕获失败，给用户明确反馈
+                                    show_notify("划词翻译", "未能获取选中文本，请重试");
+                                }
                             }
                         }
                     });
@@ -1127,6 +1156,7 @@ fn main() -> eframe::Result<()> {
             thread::spawn(move || {
                 let mut down_x = 0;
                 let mut down_y = 0;
+                let mut last_click: Option<(Instant, i32, i32)> = None;
                 let callback = move |event: Event| match event.event_type {
                     EventType::MouseMove { x, y } => {
                         MOUSE_X.store(x as i32, Ordering::Relaxed);
@@ -1142,9 +1172,35 @@ fn main() -> eframe::Result<()> {
                         }
                         let up_x = MOUSE_X.load(Ordering::Relaxed);
                         let up_y = MOUSE_Y.load(Ordering::Relaxed);
-                        if (((up_x - down_x).pow(2) + (up_y - down_y).pow(2)) as f64).sqrt() > 10.0
-                        {
-                            let _ = capture_tx.send((up_x, up_y));
+                        let moved_sq = (up_x - down_x).pow(2) + (up_y - down_y).pow(2);
+                        if moved_sq > DRAG_CAPTURE_DISTANCE_PX.pow(2) {
+                            last_click = None;
+                            let _ = capture_tx.send(CaptureRequest {
+                                x: up_x,
+                                y: up_y,
+                                trigger: CaptureTrigger::Drag,
+                            });
+                            return;
+                        }
+
+                        let now = Instant::now();
+                        let is_double_click = last_click
+                            .map(|(last_time, last_x, last_y)| {
+                                now.duration_since(last_time) <= DOUBLE_CLICK_MAX_INTERVAL
+                                    && (up_x - last_x).pow(2) + (up_y - last_y).pow(2)
+                                        <= DOUBLE_CLICK_DISTANCE_PX.pow(2)
+                            })
+                            .unwrap_or(false);
+
+                        if is_double_click {
+                            last_click = None;
+                            let _ = capture_tx.send(CaptureRequest {
+                                x: up_x,
+                                y: up_y,
+                                trigger: CaptureTrigger::DoubleClick,
+                            });
+                        } else {
+                            last_click = Some((now, up_x, up_y));
                         }
                     }
                     EventType::KeyPress(rdev::Key::Escape) => {
